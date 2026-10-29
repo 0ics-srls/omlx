@@ -742,7 +742,8 @@ class EngineCore:
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=skip_cache_store,
             preserve_reasoning=preserve_reasoning,
-            benchmark_trace=benchmark_trace,
+            # 0ics: OMLX_0ICS_TRACE=1 accende la traccia [benchmark-prefill] su ogni richiesta (studio del costo per turno)
+            benchmark_trace=benchmark_trace or os.environ.get("OMLX_0ICS_TRACE") == "1",
             benchmark_ane_sequence_length=benchmark_ane_sequence_length,
         )
 

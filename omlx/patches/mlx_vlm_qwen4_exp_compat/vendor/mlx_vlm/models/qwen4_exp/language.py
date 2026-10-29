@@ -1695,6 +1695,42 @@ class Qwen4ExpQSAIndexer(nn.Module):
         return selected_tokens[:, None]
 
 
+
+_0ICS_QSA = os.environ.get("OMLX_0ICS_QSA_PATHS") == "1"
+_0ICS_QSA_BATCH_FROM = int(os.environ.get("OMLX_0ICS_QSA_BATCH_VERIFY_FROM", "0"))
+_0ICS_QSA_CNT: dict = {}
+
+
+def _0ics_qsa(path, x):
+    if not _0ICS_QSA:
+        return
+    k = f"{path}/r{x.shape[1]}"
+    _0ICS_QSA_CNT[k] = _0ICS_QSA_CNT.get(k, 0) + 1
+    if sum(_0ICS_QSA_CNT.values()) >= 600:
+        logging.getLogger("omlx.scheduler").info("[0ics-qsa] strade: %s", dict(sorted(_0ICS_QSA_CNT.items())))
+        _0ICS_QSA_CNT.clear()
+
+
+
+_0ICS_QSTEP = os.environ.get("OMLX_0ICS_QSA_STEPS") == "1"
+_0ICS_QSTEP_ACC: dict = {}
+_0ICS_QSTEP_N = [0]
+
+
+def _0ics_qstep(cat, t0, *arrays, done=False, kv=0, rows=0):
+    if not _0ICS_QSTEP:
+        return t0
+    mx.eval(*[a for a in arrays if a is not None])
+    t = time.perf_counter()
+    _0ICS_QSTEP_ACC[cat] = _0ICS_QSTEP_ACC.get(cat, 0.0) + (t - t0)
+    if done:
+        _0ICS_QSTEP_N[0] += 1
+        if _0ICS_QSTEP_N[0] % 600 == 0:
+            parts = ", ".join(f"{k} {v * 1000 / 600:.3f}ms" for k, v in _0ICS_QSTEP_ACC.items())
+            logging.getLogger("omlx.scheduler").info("[0ics-qsa-steps] 600 chiamate, kv=%d righe=%d, per chiamata: %s", kv, rows, parts)
+            _0ICS_QSTEP_ACC.clear()
+    return t
+
 class Qwen4ExpAttention(Qwen3_5Attention):
     def __init__(self, config: TextConfig):
         super().__init__(config)
@@ -1845,6 +1881,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         """Project once, append both caches, and attend only to selected K/V."""
 
         batch, length, _ = x.shape
+        _q = time.perf_counter() if _0ICS_QSTEP else 0.0
+        if _0ICS_QSTEP:
+            mx.eval(x)
+            _q = time.perf_counter()
         q_proj_output, keys, values = (
             _target_verify_linears((self.q_proj, self.k_proj, self.v_proj), x)
             if target_verify
@@ -1877,6 +1917,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             unsqueeze_dim=1,
         )
         keys, values = cache.update_and_fetch(keys, values)
+        _q = _0ics_qstep("proiezioni+kv_append", _q, keys, values, queries)
 
         projected = (
             _target_verify_linear(self.indexer.index_qk_proj, x)
@@ -1902,6 +1943,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             self.indexer._apply_rope,
             cache_tag=self.indexer,
         )
+        _q = _0ics_qstep("indexer_append+pool", _q, pooled_index_keys, raw_index_keys)
         index_queries = self.indexer._apply_rope(
             index_queries,
             text_position_ids,
@@ -1945,12 +1987,15 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 )
             )
         output = outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=1)
+        _q = _0ics_qstep("qsa_select+attn", _q, output)
         output = output.reshape(batch, length, -1)
-        return (
+        _out = (
             _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
             if target_verify
             else self.o_proj(output * mx.sigmoid(gate))
         )
+        _0ics_qstep("o_proj", _q, _out, done=True, kv=past_len, rows=length)
+        return _out
 
     def _gathered_text_decode(
         self,
@@ -2052,6 +2097,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         attend through gathered QSA, or densely just below the crossover."""
 
         if not (target_verify and _row_exact_verify_armed()):
+            return False
+        # 0ics: oltre OMLX_0ICS_QSA_BATCH_VERIFY_FROM token di contesto l attenzione della verifica lascia il ciclo riga per
+        # riga (4 selezioni QSA per strato) e prende la strada gathered a piu righe; il resto della verifica resta row-exact.
+        if (
+            _0ICS_QSA_BATCH_FROM
+            and isinstance(getattr(cache, "offset", None), int)
+            and cache.offset >= _0ICS_QSA_BATCH_FROM
+        ):
             return False
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
@@ -2315,6 +2368,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_embeddings,
             target_verify,
         ):
+            _0ics_qsa("gathered_decode", x)
             return self._gathered_text_decode(x, cache, position_ids)
 
         if self._gathered_text_prefill_eligible(
@@ -2325,6 +2379,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_embeddings,
             target_verify,
         ):
+            _0ics_qsa("gathered_prefill", x)
             cache._omlx_last_prefill_gathered = True
             return self._gathered_text_prefill(x, cache, position_ids)
 
@@ -2338,6 +2393,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ):
             if x.shape[1] > 1:
                 cache._omlx_last_prefill_gathered = True
+            _0ics_qsa("rowexact_gathered_verify", x)
             return self._row_exact_gathered_verify(x, cache, position_ids)
 
         if self._gathered_text_verify_eligible(
@@ -2349,6 +2405,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             target_verify,
         ):
             cache._omlx_last_prefill_gathered = True
+            _0ics_qsa("gathered_verify", x)
             return self._gathered_text_prefill(
                 x, cache, position_ids, target_verify=True
             )
@@ -2357,6 +2414,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             x, mask, cache, position_embeddings, target_verify
         ):
             cache._omlx_last_prefill_gathered = False
+            _0ics_qsa("rowexact_masked_verify", x)
             return self._row_exact_masked_verify(x, cache, position_ids)
 
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
@@ -2380,6 +2438,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 # The indexer mask already includes each row's left padding.
                 mask = qsa_mask
         if target_verify:
+            _0ics_qsa("generic_verify_dense", x)
             return _VERIFIER._attention(
                 self, x, mask, cache, position_ids, position_embeddings
             )
@@ -2390,6 +2449,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and type(cache) is QSAKVCache
             and position_embeddings is None
         ):
+            _0ics_qsa("masked_decode", x)
             return self._masked_decode(x, mask, cache, position_ids)
         return super().__call__(
             x,
@@ -3792,6 +3852,38 @@ def _hc_write(hyper_input, branch, weights):
     return hyper_input + injection.reshape(*hyper_input.shape)
 
 
+# 0ics: profilo per componente dei passaggi corti (OMLX_0ICS_LAYER_PROFILE=1, righe <= OMLX_0ICS_LAYER_PROFILE_ROWS,
+# default 8). Ogni componente viene sincronizzato (mx.eval) e cronometrato: i tempi assoluti salgono un po per le
+# sincronizzazioni, la ripartizione fra componenti e il punto da guardare. Riassunto nel log ogni 50 passaggi.
+_0ICS_PROF = os.environ.get("OMLX_0ICS_LAYER_PROFILE") == "1"
+_0ICS_PROF_ROWS = int(os.environ.get("OMLX_0ICS_LAYER_PROFILE_ROWS", "8"))
+_0ICS_ACC: dict = {}
+_0ICS_N = [0]
+_0ICS_EVERY = int(os.environ.get("OMLX_0ICS_LAYER_PROFILE_EVERY", "50"))
+_0ICS_ON = [False]
+
+
+def _0ics_mark(cat, t0, *arrays):
+    if not _0ICS_ON[0]:
+        return t0
+    mx.eval(*[a for a in arrays if a is not None])
+    t = time.perf_counter()
+    k = _0ICS_ACC.setdefault(cat, [0.0, 0])
+    k[0] += t - t0
+    k[1] += 1
+    return t
+
+
+def _0ics_report(rows, kv):
+    _0ICS_N[0] += 1
+    if _0ICS_N[0] % _0ICS_EVERY:
+        return
+    tot = sum(v[0] for v in _0ICS_ACC.values()) or 1.0
+    parts = ", ".join(f"{k} {v[0] * 1000 / _0ICS_EVERY:.2f}ms ({100 * v[0] / tot:.0f}%)" for k, v in sorted(_0ICS_ACC.items(), key=lambda x: -x[1][0]))
+    logging.getLogger("omlx.scheduler").info("[0ics-profile] %d passaggi, ultimo righe=%d kv=%s, per passaggio: %s, totale %.2fms", _0ICS_EVERY, rows, kv, parts, tot * 1000 / _0ICS_EVERY)
+    _0ICS_ACC.clear()
+
+
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -3828,6 +3920,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         pending write as ``(residual, branch, gate)`` instead of applying it."""
         # Children by item (one dict lookup, not nn.Module.__getattr__):
         # this runs for every layer of every decode step.
+        _t = time.perf_counter() if _0ICS_ON[0] else 0.0
         if "ple" in self:
             if write is not None:
                 # The PLE block reads the full residual.
@@ -3841,11 +3934,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 target_verify=target_verify,
             )
 
+        _t = _0ics_mark(("v." if target_verify else "p.") + "ple", _t, hidden_states)
         mixed, hyper_input, injection_weights = self["attn_hyper_connection"](
             hidden_states,
             target_verify=target_verify,
             write=write,
         )
+        _t = _0ics_mark(("v." if target_verify else "p.") + "hc_attn", _t, mixed, hyper_input, injection_weights)
         if self.is_linear:
             linear_attn = self["linear_attn"]
             branch = (
@@ -3861,13 +3956,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 position_ids=position_ids,
                 target_verify=target_verify,
             )
+        _t = _0ics_mark(("v." if target_verify else "p.") + ("gdn" if self.is_linear else "qsa_attn"), _t, branch)
         mixed, hyper_input, injection_weights = self["mlp_hyper_connection"](
             hyper_input,
             target_verify=target_verify,
             write=(branch, injection_weights),
         )
+        _t = _0ics_mark(("v." if target_verify else "p.") + "hc_mlp", _t, mixed, hyper_input, injection_weights)
         mlp = self["mlp"]
         branch = _VERIFIER._feed_forward(mlp, mixed) if target_verify else mlp(mixed)
+        _t = _0ics_mark(("v." if target_verify else "p.") + "moe", _t, branch)
         if defer_write:
             return hyper_input, branch, injection_weights
         return _hc_write(hyper_input, branch, injection_weights)
@@ -3932,6 +4030,13 @@ class Qwen4ExpModel(nn.Module):
             <= _EAGER_DISPATCH_MAX_ROWS
         )
         write = None
+        _rows = hidden_states.shape[0] * hidden_states.shape[1]
+        _0ICS_ON[0] = _0ICS_PROF and _rows <= _0ICS_PROF_ROWS
+        if _0ICS_PROF and os.environ.get("OMLX_0ICS_CALLS") == "1":
+            logging.getLogger("omlx.scheduler").info("[0ics-call] righe=%d verify=%s", _rows, gdn_sink is not None)
+        if _0ICS_ON[0]:
+            mx.eval(hidden_states)
+            _tp = time.perf_counter()
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
@@ -3963,6 +4068,10 @@ class Qwen4ExpModel(nn.Module):
                     write = None
                 hidden_sink.append(mixed)
 
+        if _0ICS_ON[0]:
+            _0ICS_ON[0] = False
+            _kv = getattr(cache[self.fa_idx], "offset", "?") if cache[self.fa_idx] is not None else "?"
+            _0ics_report(_rows, _kv)
         mixed = None
         if write is not None:
             # The final mixer applies the last write and returns the residual.
