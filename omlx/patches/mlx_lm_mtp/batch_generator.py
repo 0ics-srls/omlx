@@ -24,6 +24,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from statistics import median
 from types import SimpleNamespace
+
+from omlx.patches import p2_lookup as _p2_lookup
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from omlx.prefill_progress import get_prefill_tracker
@@ -50,6 +52,9 @@ def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
 
 
 _ROW_EXACT_DISABLED = os.environ.get("OMLX_MTP_ROW_EXACT_VERIFY", "1").strip() == "0"
+
+
+_P2_ROW_EXACT_MAX_ROWS = int(os.environ.get("OMLX_P2_ROW_EXACT_MAX_ROWS", "4"))
 
 
 def _row_exact_verify(model: Any) -> bool:
@@ -2101,7 +2106,12 @@ def _call_backbone_impl(
     # one-row baseline, so B > 1 verify keeps the multi-row kernels.
     _set_verify_qmm_armed(
         not dspark_verify,
-        row_exact=inputs.shape[0] == 1 and _row_exact_verify(model),
+        # Phase-2 (mac-studio-m5-ultra, OMLX_P2_ROW_EXACT_MAX_ROWS, default 4): row-exact verify runs its rows one by one, so
+        # prompt-lookup rounds (8-15 verify rows) are faster on the batched kernels; acceptance stays exact. 4 rows = an MTP
+        # depth-3 window. (M5 Ultra, Qwen3.8-Flash-Next oQ6e: edit turns 199 -> 273 tok/s.)
+        row_exact=inputs.shape[0] == 1
+        and int(inputs.shape[-1]) <= _P2_ROW_EXACT_MAX_ROWS
+        and _row_exact_verify(model),
     )
     _set_dspark_target_verify(model, dspark_verify)
     try:
@@ -2932,6 +2942,8 @@ def _chain_next_drafts(
     hidden_rows: Any,
     committed: Any,
     prev_buf: Optional[Any],
+    lookup_drafts: Optional[List[int]] = None,
+    vocab: int = 0,
 ) -> None:
     """Rebuild committed MTP-head history and draft the next chain.
 
@@ -2967,7 +2979,7 @@ def _chain_next_drafts(
     procs = _proc_list(gen_batch)
 
     depth = state.controller.cur if state.controller is not None else state.depth
-    if depth == 0 and not state.mtp_cache:
+    if depth == 0 and not state.mtp_cache and not lookup_drafts:
         # Depth-0 with a stateless head (no cache to keep warm, e.g. the
         # gemma4 assistant): skip the fold entirely — on fast backbones its
         # head forward + trunk norm is a measurable per-step tax (~15% of a
@@ -3007,6 +3019,11 @@ def _chain_next_drafts(
             hidden_rows, committed.reshape(1, n), state.mtp_cache
         )
     state.hist_offset += int(n)
+
+    if lookup_drafts:
+        # p2 prompt lookup: the head has folded the committed tokens; verify the earlier continuation instead of a chain.
+        _p2_lookup.set_drafts(state, lookup_drafts, vocab)
+        return
 
     draft_toks: List[Any] = []
     draft_lps: List[Any] = []
@@ -3653,6 +3670,8 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
 
 
 def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
+    if _p2_lookup.ENABLED:
+        _p2_lookup.log_stats(uid, stats)
     """Emit a one-line summary of MTP draft/verify activity for a finished sequence.
 
     Format chosen to match PR 990's headline metrics, plus component timings
@@ -4139,8 +4158,8 @@ def _run_verify_cycle_chain(
 
     # --- stats ---
     state.stats.cycles += 1
-    if len(state.stats.depth_drafted) < state.depth:
-        pad = state.depth - len(state.stats.depth_drafted)
+    if len(state.stats.depth_drafted) < max(state.depth, k):
+        pad = max(state.depth, k) - len(state.stats.depth_drafted)
         state.stats.depth_drafted.extend([0] * pad)
         state.stats.depth_accepted.extend([0] * pad)
     for j in range(k):
@@ -4155,6 +4174,8 @@ def _run_verify_cycle_chain(
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
     accept_ms = (time.perf_counter() - cycle_t0) * 1000
+
+    p2_was_lookup = _p2_lookup.ENABLED and _p2_lookup.was_pending(state)
 
     def draft_next():
         # --- MTP-head history + next draft chain (async-dispatched) ---
@@ -4181,7 +4202,15 @@ def _run_verify_cycle_chain(
             else:
                 draft_jobs.append(job)
         elif draft_jobs is None:
-            _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
+            p2_drafts = None
+            if _p2_lookup.ENABLED:
+                _p2_lookup.observe(state, p2_was_lookup, k, m)
+                state.stats._p2_lookup_ref = state._p2_lookup
+                p2_drafts = _p2_lookup.propose(gen_batch, state)
+            _chain_next_drafts(
+                gen_batch, state, hidden_rows, committed, prev_buf,
+                lookup_drafts=p2_drafts, vocab=int(combined_lp.shape[-1]),
+            )
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
         state.next_main = next_main
@@ -4225,7 +4254,7 @@ def _run_verify_cycle_chain(
         if materialize_boundary_emit:
             _materialize_mtp_boundary_emit(gen_batch, state)
             state.boundary_emit_pending = False
-        if state.controller is not None:
+        if state.controller is not None and not p2_was_lookup:
             was_warmup = bool(state.controller._warmup)
             keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
             if keepalive:
