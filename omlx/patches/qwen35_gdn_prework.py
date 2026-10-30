@@ -1493,7 +1493,20 @@ def _qwen4_decode_state_eligible(inputs, cache) -> bool:
     )
 
 
+def _0ics_geometry(name):
+    # 0ics: OMLX_0ICS_GDN_IN / OMLX_0ICS_GDN_OUT = "columns,rows" overrides the
+    # verify tile for 4-row blocks (geometry never changes an output bit).
+    raw = os.environ.get(name, "").strip()
+    return tuple(int(v) for v in raw.split(",")) if raw else None
+
+
+_0ICS_GDN_IN = _0ics_geometry("OMLX_0ICS_GDN_IN")
+_0ICS_GDN_OUT = _0ics_geometry("OMLX_0ICS_GDN_OUT")
+
+
 def _qwen4_verify_in_geometry(rows):
+    if rows == 4 and _0ICS_GDN_IN:
+        return _0ICS_GDN_IN
     # (Columns per simdgroup, rows per threadgroup) of the stacked
     # in-projection: the one-row decode tile, and for verify blocks rows share
     # each decoded weight tile three or two at a time (fastest over a chain of
@@ -1504,6 +1517,8 @@ def _qwen4_verify_in_geometry(rows):
 
 
 def _qwen4_verify_out_geometry(rows):
+    if rows == 4 and _0ICS_GDN_OUT:
+        return _0ICS_GDN_OUT
     # The one-row decode tile, and stock qmv_fast's four columns per
     # simdgroup (one row per threadgroup) for verify blocks.
     return (_QWEN4_OUT_QMV_RPS, 1) if rows == 1 else (4, 1)
@@ -1607,15 +1622,34 @@ def _qwen4_verify(plan, inputs, cache):
         dk,
         dv,
     ) = plan
-    conv_state, window, states, state, gated = qwen4_verify_step_fused(
-        in_rows(inputs), cache[0], conv_w, q_scale, A_log, dt_bias, cache[1], norm_w,
-        eps, hk, hv, dk, dv,
-    )
+    projected = in_rows(inputs)
+    double = _0ics_double()
+    if "gdn_in" in double:
+        projected = _0ics_after(projected, in_rows(_0ics_after(inputs, projected)))
+    step_args = (cache[0], conv_w, q_scale, A_log, dt_bias, cache[1], norm_w, eps, hk, hv, dk, dv)
+    conv_state, window, states, state, gated = qwen4_verify_step_fused(projected, *step_args)
+    if "gdn_step" in double:
+        again = qwen4_verify_step_fused(_0ics_after(projected, gated), *step_args)
+        gated = _0ics_after(gated, *again)
     cache.record_speculative_window(0, window, 3)
     cache[0] = conv_state
     cache.record_speculative_states(1, states, state)
     cache[1] = state
-    return out_rows(gated)
+    out = out_rows(gated)
+    if "gdn_out" in double:
+        out = _0ics_after(out, out_rows(_0ics_after(gated, out)))
+    return out
+
+
+def _0ics_double():
+    """OMLX_0ICS_DOUBLE (see qwen4_exp language.py): gdn_in, gdn_step, gdn_out run twice."""
+    return frozenset(filter(None, os.environ.get("OMLX_0ICS_DOUBLE", "").split(",")))
+
+
+def _0ics_after(x, *deps):
+    from mlx_vlm.models.qwen4_exp.language import _0ics_after as after
+
+    return after(x, *deps)
 
 
 def _qwen4_decode_dynamic_eligible(

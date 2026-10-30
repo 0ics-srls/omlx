@@ -3938,6 +3938,42 @@ def _0ics_width(x):
     return x.shape[-1] // 4
 
 
+# 0ics: OMLX_0ICS_DOUBLE=hc,moe runs those stateless blocks of the verify passes a
+# second time, after the first and on inputs that depend on its result, and adds
+# the copy times zero: the output and the caches stay exact, the extra time per
+# cycle is what the block really costs in the layer-after-layer pass.
+_0ICS_DOUBLE = frozenset(filter(None, os.environ.get("OMLX_0ICS_DOUBLE", "").split(",")))
+
+
+_0ICS_AFTER_KERNEL = []
+
+
+def _0ics_after(x, *deps):
+    """A copy of ``x`` made by one kernel that also reads ``deps``: it runs after them."""
+    if not _0ICS_AFTER_KERNEL:
+        _0ICS_AFTER_KERNEL.append(mx.fast.metal_kernel(
+            name="omlx_0ics_after",
+            input_names=["x", "d"],
+            output_names=["y"],
+            source="""
+                uint i = thread_position_in_grid.x;
+                if (i == 0 && d[0] != d[0]) { y[0] = x[0]; }
+                if (i < N) y[i] = x[i];
+            """,
+        ))
+    out = x
+    for d in deps:
+        out = _0ICS_AFTER_KERNEL[0](
+            inputs=[out, d.reshape(-1)],
+            template=[("N", out.size)],
+            grid=(-(-out.size // 256) * 256, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[out.shape],
+            output_dtypes=[out.dtype],
+        )[0]
+    return out
+
+
 def _0ics_hc_skip(hidden_states, hidden):
     lead = hidden_states.shape[:-1]
     return hidden_states[..., :hidden], hidden_states, mx.ones((*lead, 4), dtype=hidden_states.dtype)
@@ -4002,6 +4038,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 target_verify=target_verify,
                 write=write,
             )
+            if target_verify and "hc" in _0ICS_DOUBLE:
+                again = self["attn_hyper_connection"](
+                    _0ics_after(hidden_states, mixed, injection_weights),
+                    target_verify=target_verify,
+                    write=write,
+                )
+                mixed = _0ics_after(mixed, *again)
         _t = _0ics_mark(("v." if target_verify else "p.") + "hc_attn", _t, mixed, hyper_input, injection_weights)
         if self.is_linear:
             linear_attn = self["linear_attn"]
@@ -4022,17 +4065,28 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if target_verify and "hc" in _0ICS_ABLATE:
             mixed, hyper_input, injection_weights = _0ics_hc_skip(hyper_input, _0ics_width(hyper_input))
         else:
+            _hc_in, _hc_write_in = hyper_input, (branch, injection_weights)
             mixed, hyper_input, injection_weights = self["mlp_hyper_connection"](
                 hyper_input,
                 target_verify=target_verify,
                 write=(branch, injection_weights),
             )
+            if target_verify and "hc" in _0ICS_DOUBLE:
+                again = self["mlp_hyper_connection"](
+                    _0ics_after(_hc_in, mixed, injection_weights),
+                    target_verify=target_verify,
+                    write=_hc_write_in,
+                )
+                mixed = _0ics_after(mixed, *again)
         _t = _0ics_mark(("v." if target_verify else "p.") + "hc_mlp", _t, mixed, hyper_input, injection_weights)
         mlp = self["mlp"]
         if target_verify and "moe" in _0ICS_ABLATE:
             branch = mixed
         else:
             branch = _VERIFIER._feed_forward(mlp, mixed) if target_verify else mlp(mixed)
+            if target_verify and "moe" in _0ICS_DOUBLE:
+                again = _VERIFIER._feed_forward(mlp, _0ics_after(mixed, branch))
+                branch = _0ics_after(branch, again)
         _t = _0ics_mark(("v." if target_verify else "p.") + "moe", _t, branch)
         if defer_write:
             return hyper_input, branch, injection_weights
