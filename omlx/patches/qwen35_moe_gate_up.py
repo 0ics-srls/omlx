@@ -49,7 +49,7 @@ from mlx_vlm.models.switch_layers import (
 )
 
 from ..scheduler import _sync_and_clear_cache
-from . import moe_verify_gather
+from . import moe_verify_gather, moe_verify_grouped
 from .m5_gather_qmm import fused_gate_up_activation
 from .moe_routes import sort_routes
 from .module_cache import cached_per_module
@@ -268,11 +268,48 @@ def _make_vlm_patched_call(original):
     return patched
 
 
+# 0ics: OMLX_0ICS_MOE_REUSE=1 logs, every 480 verify calls, how many distinct
+# experts the rows of a verify block route to (numbers only). OMLX_0ICS_MOE_GROUPED=1
+# takes moe_verify_grouped (one read per distinct expert, same bits).
+_0ICS_REUSE = os.environ.get("OMLX_0ICS_MOE_REUSE", "0") == "1"
+_0ICS_REUSE_BUF: list = []
+_0ICS_VERIFY_QMM = os.environ.get("OMLX_0ICS_MOE_VERIFY_QMM", "0") == "1"
+
+
+def _0ics_reuse(indices):
+    flat = mx.sort(indices.reshape(-1))
+    distinct = 1 + mx.sum(flat[1:] != flat[:-1])
+    _0ICS_REUSE_BUF.append((int(indices.size // indices.shape[-1]), int(indices.shape[-1]), distinct))
+    if len(_0ICS_REUSE_BUF) < 480:
+        return
+    mx.eval([d for _, _, d in _0ICS_REUSE_BUF])
+    per_rows: dict = {}
+    for rows, k, d in _0ICS_REUSE_BUF:
+        c = per_rows.setdefault(rows, [0, 0, k])
+        c[0] += 1
+        c[1] += d.item()
+    _0ICS_REUSE_BUF.clear()
+    logging.getLogger("omlx.scheduler").info(
+        "0ics moe-reuse: "
+        + "; ".join(
+            f"rows {r}: calls {c[0]} distinct {c[1] / c[0]:.1f} of {r * c[2]}"
+            for r, c in sorted(per_rows.items())
+        )
+    )
+
+
 def _fused_verify_switch(switch_mlp, x, indices):
     """Keep unsorted routing for the verifier's per-position reductions."""
     batch, length, width = x.shape
     top_k = indices.shape[-1]
-    routed = moe_verify_gather.fused_switch(switch_mlp, x, indices)
+    if _0ICS_REUSE:
+        _0ics_reuse(indices)
+    # OMLX_0ICS_MOE_VERIFY_QMM=1: MLX's gather_qmm below, same bits as the
+    # pair kernel and faster on the M5 Ultra (micro-verify-moe: -10% at 4 rows,
+    # -17% at 8 with the routing reuse measured on the model).
+    routed = None if _0ICS_VERIFY_QMM else (
+        moe_verify_grouped if moe_verify_grouped.ENABLED else moe_verify_gather
+    ).fused_switch(switch_mlp, x, indices)
     if routed is not None:
         return routed
     flat_x = mx.expand_dims(x.reshape(batch * length, width), (-2, -3))

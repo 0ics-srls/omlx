@@ -51,6 +51,8 @@ _NAX_DISABLED = not env_enabled("OMLX_QWEN4_HC_NAX_PREFILL")
 _NAX_AVAILABLE: bool | None = None
 _NAX_BROKEN = False
 _DECODE_V2 = env_enabled("OMLX_QWEN4_HC_DECODE_V2")
+import os as _os
+_0ICS_HC_ABLATE = _os.environ.get("OMLX_0ICS_HC_ABLATE", "")
 _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
 _FAILURE_LOGGED = False
@@ -1288,12 +1290,27 @@ def fused_forward(module, hyper_input, write=None):
                 return None
         v2 = _decode_v2(rows, hc, hidden, lowrank, up.bits, inject is not None)
         if v2:
-            written, normed, parts = _kernel_norm_down(
-                module, flat, operands, rows, hc, hidden, lowrank, dtype, down, inject
-            )
-            mixed, injection = _kernel_up_mix(
-                normed, parts, rows, hc, hidden, lowrank, dtype, up, inject is not None
-            )
+            # 0ics: OMLX_0ICS_HC_ABLATE=down|up replaces one of the two launches
+            # with a stand-in of the same shapes, for timing only (garbage out).
+            if _0ICS_HC_ABLATE == "down":
+                written, normed = None, flat
+                parts = mx.zeros((rows, hc, lowrank + hc), dtype=mx.float32)
+            else:
+                norm_down = (
+                    hc_fused_mr.norm_down
+                    if hc_fused_mr.usable(rows, hc, hidden, lowrank, inject is not None)
+                    else _kernel_norm_down
+                )
+                written, normed, parts = norm_down(
+                    module, flat, operands, rows, hc, hidden, lowrank, dtype, down, inject
+                )
+            if _0ICS_HC_ABLATE == "up":
+                mixed = normed[:, :hidden]
+                injection = parts[:, 0, :hc].astype(dtype)
+            else:
+                mixed, injection = _kernel_up_mix(
+                    normed, parts, rows, hc, hidden, lowrank, dtype, up, inject is not None
+                )
         else:
             written, normed = (
                 (None, _kernel_norm(module, flat, rows, hc, hidden, dtype))
@@ -1395,3 +1412,5 @@ __all__ = [
     "prefill_forward",
     "write_enabled",
 ]
+
+from . import hc_fused_mr  # noqa: E402  (0ics multi-row norm/down; imports this module)

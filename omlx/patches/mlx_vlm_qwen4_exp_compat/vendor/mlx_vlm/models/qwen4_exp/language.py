@@ -2488,6 +2488,27 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         return self.o_proj(output * mx.sigmoid(gate))
 
 
+# 0ics: OMLX_0ICS_HC_PATHS=1 counts which path each hyper-connection call takes
+# (fused / prefill / eager), by rows and verify; summary every 20000 calls.
+_0ICS_HC_PATHS = os.environ.get("OMLX_0ICS_HC_PATHS") == "1"
+_0ICS_HC_COUNT: dict = {}
+
+
+def _0ics_hc(path, hyper_input, target_verify, write):
+    shape = hyper_input.shape
+    key = (path, shape[0] * shape[1] if len(shape) == 3 else -1, target_verify, write is not None)
+    _0ICS_HC_COUNT[key] = _0ICS_HC_COUNT.get(key, 0) + 1
+    if sum(_0ICS_HC_COUNT.values()) >= 20000:
+        logging.getLogger("omlx.scheduler").info(
+            "0ics hc-paths: "
+            + "; ".join(
+                f"{k[0]} rows {k[1]} verify {int(k[2])} write {int(k[3])}: {n}"
+                for k, n in sorted(_0ICS_HC_COUNT.items(), key=lambda x: -x[1])
+            )
+        )
+        _0ICS_HC_COUNT.clear()
+
+
 class Qwen4ExpGatedResidual(nn.Module):
     def __init__(self, config: TextConfig, use_combine: bool = True):
         super().__init__()
@@ -2521,8 +2542,14 @@ class Qwen4ExpGatedResidual(nn.Module):
             fused = None
             if hc_fused.write_enabled() and hc_fused.compatible(self, hyper_input):
                 fused = hc_fused.fused_forward(self, hyper_input, write)
+                if _0ICS_HC_PATHS:
+                    _0ics_hc("fused" if fused is not None else "fused-failed", hyper_input, target_verify, write)
             elif not target_verify and hc_fused.prefill_compatible(self, hyper_input):
                 fused = hc_fused.prefill_forward(self, hyper_input, write)
+                if _0ICS_HC_PATHS:
+                    _0ics_hc("prefill" if fused is not None else "prefill-failed", hyper_input, target_verify, write)
+            elif _0ICS_HC_PATHS:
+                _0ics_hc("write-eager", hyper_input, target_verify, write)
             if fused is not None:
                 return fused
             hyper_input = _hc_write(hyper_input, *write)
@@ -2530,8 +2557,12 @@ class Qwen4ExpGatedResidual(nn.Module):
             return out if "block_inject_weight" in self else (out, hyper_input)
         if hc_fused.compatible(self, hyper_input):
             fused = hc_fused.fused_forward(self, hyper_input)
+            if _0ICS_HC_PATHS:
+                _0ics_hc("fused" if fused is not None else "fused-failed", hyper_input, target_verify, None)
             if fused is not None:
                 return fused
+        elif _0ICS_HC_PATHS:
+            _0ics_hc("not-compatible", hyper_input, target_verify, None)
         if not target_verify and hc_fused.prefill_compatible(self, hyper_input):
             fused = hc_fused.prefill_forward(self, hyper_input)
             if fused is not None:
@@ -3884,6 +3915,21 @@ def _0ics_report(rows, kv):
     _0ICS_ACC.clear()
 
 
+# 0ics: OMLX_0ICS_ABLATE=hc,moe drops those blocks from the verify passes, for
+# timing only (the output is garbage): the drop in ms per cycle is what the block
+# costs in the real, layer-after-layer pass.
+_0ICS_ABLATE = frozenset(filter(None, os.environ.get("OMLX_0ICS_ABLATE", "").split(",")))
+
+
+def _0ics_width(x):
+    return x.shape[-1] // 4
+
+
+def _0ics_hc_skip(hidden_states, hidden):
+    lead = hidden_states.shape[:-1]
+    return hidden_states[..., :hidden], hidden_states, mx.ones((*lead, 4), dtype=hidden_states.dtype)
+
+
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -3935,11 +3981,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         _t = _0ics_mark(("v." if target_verify else "p.") + "ple", _t, hidden_states)
-        mixed, hyper_input, injection_weights = self["attn_hyper_connection"](
-            hidden_states,
-            target_verify=target_verify,
-            write=write,
-        )
+        if target_verify and "hc" in _0ICS_ABLATE:
+            mixed, hyper_input, injection_weights = _0ics_hc_skip(hidden_states, _0ics_width(hidden_states))
+        else:
+            mixed, hyper_input, injection_weights = self["attn_hyper_connection"](
+                hidden_states,
+                target_verify=target_verify,
+                write=write,
+            )
         _t = _0ics_mark(("v." if target_verify else "p.") + "hc_attn", _t, mixed, hyper_input, injection_weights)
         if self.is_linear:
             linear_attn = self["linear_attn"]
@@ -3957,14 +4006,20 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 target_verify=target_verify,
             )
         _t = _0ics_mark(("v." if target_verify else "p.") + ("gdn" if self.is_linear else "qsa_attn"), _t, branch)
-        mixed, hyper_input, injection_weights = self["mlp_hyper_connection"](
-            hyper_input,
-            target_verify=target_verify,
-            write=(branch, injection_weights),
-        )
+        if target_verify and "hc" in _0ICS_ABLATE:
+            mixed, hyper_input, injection_weights = _0ics_hc_skip(hyper_input, _0ics_width(hyper_input))
+        else:
+            mixed, hyper_input, injection_weights = self["mlp_hyper_connection"](
+                hyper_input,
+                target_verify=target_verify,
+                write=(branch, injection_weights),
+            )
         _t = _0ics_mark(("v." if target_verify else "p.") + "hc_mlp", _t, mixed, hyper_input, injection_weights)
         mlp = self["mlp"]
-        branch = _VERIFIER._feed_forward(mlp, mixed) if target_verify else mlp(mixed)
+        if target_verify and "moe" in _0ICS_ABLATE:
+            branch = mixed
+        else:
+            branch = _VERIFIER._feed_forward(mlp, mixed) if target_verify else mlp(mixed)
         _t = _0ics_mark(("v." if target_verify else "p.") + "moe", _t, branch)
         if defer_write:
             return hyper_input, branch, injection_weights
