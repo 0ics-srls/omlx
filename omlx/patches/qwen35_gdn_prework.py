@@ -1622,7 +1622,7 @@ def _qwen4_verify(plan, inputs, cache):
         dk,
         dv,
     ) = plan
-    projected = in_rows(inputs)
+    projected = _0ics_dense(in_rows, inputs, "in")
     double = _0ics_double()
     if "gdn_in" in double:
         projected = _0ics_after(projected, in_rows(_0ics_after(inputs, projected)))
@@ -1635,10 +1635,40 @@ def _qwen4_verify(plan, inputs, cache):
     cache[0] = conv_state
     cache.record_speculative_states(1, states, state)
     cache[1] = state
-    out = out_rows(gated)
+    out = _0ics_dense(out_rows, gated, "out")
     if "gdn_out" in double:
         out = _0ics_after(out, out_rows(_0ics_after(gated, out)))
     return out
+
+
+# 0ics: OMLX_0ICS_DENSE_IN / OMLX_0ICS_DENSE_OUT = rows | cols run the GDN verify
+# projections on qmv_rows / qmv_cols (one weight read for all rows; not bit-exact
+# with the row-exact kernels) instead of the row-exact RowsQmv.
+_0ICS_DENSE = {
+    "in": os.environ.get("OMLX_0ICS_DENSE_IN", ""),
+    "out": os.environ.get("OMLX_0ICS_DENSE_OUT", ""),
+}
+
+
+def _0ics_dense(rows_qmv_call, x, which):
+    mode = _0ICS_DENSE[which]
+    if not mode:
+        return rows_qmv_call(x)
+    from . import qmv_cols, qmv_rows
+
+    weight, scales, biases = rows_qmv_call._weights
+    k, n = rows_qmv_call._k, rows_qmv_call._n
+    group_size = k // int(scales.shape[-1])
+    bits = int(weight.shape[-1]) * 32 // k
+    rows = x.size // k
+    flat = x.reshape(rows, k)
+    if mode == "rows" and qmv_rows.supported(rows, k, n, bits, group_size):
+        y = qmv_rows.qmv_rows(flat, weight, scales, biases, bits, group_size)
+    elif mode == "cols" and qmv_cols.supported(rows, k, n, bits, group_size):
+        y = qmv_cols.qmv_cols(flat, weight, scales, biases, bits, group_size)
+    else:
+        return rows_qmv_call(x)
+    return y.reshape(*x.shape[:-1], n)
 
 
 def _0ics_double():
