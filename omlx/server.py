@@ -3928,6 +3928,16 @@ async def create_completion(
         raise
 
 
+# 0ics: OMLX_0ICS_REQ_TIMING=1 logs wall-clock marks of each chat request (times
+# only, no content), to place the first-token latency between HTTP and engine.
+_0ICS_REQ_TIMING = os.environ.get("OMLX_0ICS_REQ_TIMING") == "1"
+
+
+def _0ics_mark(label: str) -> None:
+    if _0ICS_REQ_TIMING:
+        logging.getLogger("omlx.scheduler").info("0ics req %s %.3f", label, time.time())
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -3953,6 +3963,7 @@ async def create_chat_completion(
     }
     ```
     """
+    _0ics_mark("handler")
     # Log incoming request summary at debug, message content at trace
     logger.debug(
         f"Chat completion request received: model={request.model}, "
@@ -4304,12 +4315,14 @@ async def create_chat_completion(
         # handled exception, but response already started" and the client sees
         # an incomplete chunked read. Running the check here lets
         # prefill_memory_exceeded_handler return a clean HTTP 400.
+        _0ics_mark("preflight-start")
         await _raise_if_llm_lease_abort_requested(lease)
         await engine.preflight_chat(
             messages,
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
+        _0ics_mark("preflight-end")
 
         await _raise_if_llm_lease_abort_requested(lease)
         inference_request_id = _request_abort_id(engine)
@@ -5148,6 +5161,10 @@ def _render_chat_prompt_for_thinking_detection(
             prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
 
     if isinstance(prompt, str):
+        incremental = getattr(engine, "_0ics_incremental_ids", None)
+        if callable(incremental) and os.environ.get("OMLX_0ICS_TOK_INCR") == "1":
+            # 0ics: the same ids as encoding the whole prompt, from the incremental tokenizer.
+            return prompt, incremental(prompt)
         return prompt, None
     if isinstance(prompt, list):
         try:

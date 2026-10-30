@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -4778,6 +4779,8 @@ class VLMBatchedEngine(BaseEngine):
                 yield output
             return
 
+        if os.environ.get("OMLX_0ICS_REQ_TIMING") == "1":
+            logging.getLogger("omlx.scheduler").info("0ics req stream-chat %.3f", time.time())
         # Run vision encoding on the MLX executor thread to avoid blocking
         # the event loop.  Blocking here (synchronous mx.eval) prevents
         # uvicorn from managing HTTP keep-alive connections, causing
@@ -4800,6 +4803,9 @@ class VLMBatchedEngine(BaseEngine):
             tools,
             kwargs,
         )
+
+        if os.environ.get("OMLX_0ICS_REQ_TIMING") == "1":
+            logging.getLogger("omlx.scheduler").info("0ics req prompt-ready %.3f", time.time())
 
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
@@ -5382,6 +5388,8 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
+        if _0ICS_TOK_INCR and isinstance(prompt, str):
+            return len(self._0ics_incremental_ids(prompt))  # 0ics: same count, no full re-tokenization
         return len(self._tokenizer.encode(prompt))
 
     def has_active_requests(self) -> bool:
