@@ -51,6 +51,19 @@ from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+
+# 0ics: incremental tokenization of text-only chat prompts (off by default).
+_0ICS_TOK_INCR = os.environ.get("OMLX_0ICS_TOK_INCR") == "1"
+_0ICS_TOK_CHECK = os.environ.get("OMLX_0ICS_TOK_CHECK") == "1"
+_0ICS_TOK_KEEP = 8  # cached prompts: preflight + real prompt per concurrent conversation
+_0ICS_TOK_LOCK = threading.Lock()  # preflight runs on the event loop, the real prompt on the MLX thread
+
+
+def prepare_inputs_for_check(processor, prompt: str) -> list[int]:
+    from mlx_vlm.utils import prepare_inputs
+
+    ids = prepare_inputs(processor, prompts=[prompt])["input_ids"]
+    return ids[0].tolist() if ids.ndim > 1 else ids.tolist()
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -3455,6 +3468,74 @@ class VLMBatchedEngine(BaseEngine):
             if extra_model_inputs.get(key) is not None
         }
 
+    def _0ics_incremental_ids(self, prompt: str) -> list[int]:
+        """Token ids of a text-only prompt, reusing the previous prompts' tokens.
+
+        OpenCode resends the whole conversation every turn; tokenizing ~550k
+        characters costs ~95 ms at 150k tokens, the new tail ~0.2 ms. Special
+        tokens are split off before BPE, so the ids before an ``<|im_start|>``
+        that both prompts share are the same: keep them from the cached prompt
+        with the longest common prefix and tokenize from that ``<|im_start|>``
+        on. OMLX_0ICS_TOK_CHECK=1 also tokenizes the whole prompt the usual way,
+        logs any difference and then uses the usual ids.
+        """
+        with _0ICS_TOK_LOCK:
+            return self._0ics_incremental_ids_locked(prompt)
+
+    def _0ics_incremental_ids_locked(self, prompt: str) -> list[int]:
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
+        marker = b"<|im_start|>"
+        marker_id = tokenizer.convert_tokens_to_ids(marker.decode())
+        entries = self.__dict__.setdefault("_0ics_tok_cache", [])
+        data = prompt.encode("utf-8")
+
+        def common(a: bytes, b: bytes) -> int:
+            n = min(len(a), len(b))
+            if a[:n] == b[:n]:  # the usual turn: the old prompt is a prefix
+                return n
+            lo, hi = 0, n
+            while lo < hi:  # longest common prefix by bytes slices (memcmp)
+                mid = (lo + hi + 1) // 2
+                if a[:mid] == b[:mid]:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo
+
+        ids = marks = None
+        best, shared = None, 0
+        for entry in entries:
+            n = common(entry[0], data)
+            if n > shared:
+                best, shared = entry, n
+        if best is not None:
+            cut = data.rfind(marker, 0, shared)
+            if cut > 0:
+                nth = data.count(marker, 0, cut)
+                if nth < len(best[2]):
+                    keep = best[2][nth]
+                    tail = tokenizer(data[cut:].decode("utf-8"), add_special_tokens=False)["input_ids"]
+                    ids = best[1][:keep] + list(tail)
+                    marks = best[2][:nth] + [keep + i for i, t in enumerate(tail) if t == marker_id]
+        if ids is None:
+            ids = list(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+        if _0ICS_TOK_CHECK:
+            full = prepare_inputs_for_check(self._processor, prompt)
+            if full != ids:
+                at = next((i for i, (x, y) in enumerate(zip(full, ids)) if x != y), min(len(full), len(ids)))
+                logger.warning(
+                    "0ics tok-incr: DIFFERENT from the full tokenization at token %d (%d vs %d tokens); using the full one",
+                    at, len(ids), len(full),
+                )
+                ids = full
+            else:
+                logger.info("0ics tok-incr: identical (%d tokens)", len(ids))
+        if marks is None:
+            marks = [i for i, t in enumerate(ids) if t == marker_id]
+        entries.insert(0, (data, ids, marks))
+        del entries[_0ICS_TOK_KEEP:]
+        return list(ids)
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
@@ -3664,18 +3745,30 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         # Tokenize text and preprocess images and audio
-        inputs = prepare_inputs(
-            self._processor,
-            images=images if images else None,
-            audio=audio if audio else None,
-            prompts=[prompt] if isinstance(prompt, str) else prompt,
+        incremental = (
+            _0ICS_TOK_INCR and not images and not audio and isinstance(prompt, str)
         )
+        if incremental:
+            # 0ics: text-only turns reuse the tokens of the previous prompt up to
+            # the last shared <|im_start|> (see _0ics_incremental_ids).
+            token_ids = self._0ics_incremental_ids(prompt)
+            input_ids = None  # read only on the image path below
+            inputs = {}
+            pixel_values = None
+            attention_mask = None
+        else:
+            inputs = prepare_inputs(
+                self._processor,
+                images=images if images else None,
+                audio=audio if audio else None,
+                prompts=[prompt] if isinstance(prompt, str) else prompt,
+            )
 
-        input_ids = inputs["input_ids"]
-        pixel_values = inputs.get("pixel_values")
-        attention_mask = inputs.get("attention_mask")
+            input_ids = inputs["input_ids"]
+            pixel_values = inputs.get("pixel_values")
+            attention_mask = inputs.get("attention_mask")
 
-        token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
+            token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
         image_cache_key_start = 0
         image_cache_key_ranges: list[Tuple[int, str]] = []
         if image_message_ranges:
@@ -4572,7 +4665,11 @@ class VLMBatchedEngine(BaseEngine):
         # the real chat path surface the same error through the existing
         # handler chain.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            if _0ICS_TOK_INCR and not images and isinstance(prompt, str):
+                # 0ics: same token count, from the incremental tokenizer.
+                num_tokens = len(self._0ics_incremental_ids(prompt))
+            else:
+                num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
