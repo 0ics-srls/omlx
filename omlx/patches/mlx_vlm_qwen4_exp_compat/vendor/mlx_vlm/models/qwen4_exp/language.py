@@ -109,6 +109,15 @@ def _rank_two_text_position_ids(
     )
 
 
+# 0ics: OMLX_0ICS_MTP_GATHERED=1 lets the MTP head's history fold (2..4 rows,
+# not a verify) take the gathered QSA path. On the masked path it builds a dense
+# mask and attends every key: measured on the model, the fold costs 1.0 ms at 1k,
+# 3.0-3.5 ms at 64k and 3.4-5.6 ms at 116k (growing cycle after cycle), and 1.4 ms
+# at 116k gathered. The head only proposes drafts: the trunk verifies every token
+# against its own distribution, so the output stays the same (greedy text identical).
+_0ICS_MTP_GATHERED = os.environ.get("OMLX_0ICS_MTP_GATHERED") == "1"
+
+
 def _gathered_min_query_tokens() -> int:
     """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
     raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
@@ -1769,7 +1778,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             # Narrow multi-row windows (Lightning MTP history/verify passes)
             # are cheaper on the official masked path; see
             # _gathered_min_query_tokens.
-            and x.shape[1] >= _gathered_min_query_tokens()
+            and x.shape[1] >= (
+                2
+                if _0ICS_MTP_GATHERED and getattr(self, "_0ics_mtp_head", False)
+                else _gathered_min_query_tokens()
+            )
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
@@ -4026,6 +4039,22 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return _hc_write(hyper_input, branch, injection_weights)
 
 
+# 0ics: OMLX_0ICS_PASS_TIMING=1 times the verify passes in three pieces with one
+# sync each (before the layers, the 48 layers, after them) and logs the mean every
+# 50 passes with the context length: what grows with the context, and where.
+_0ICS_PASS = os.environ.get("OMLX_0ICS_PASS_TIMING") == "1"
+_0ICS_PASS_ACC = [0, 0.0, 0.0, 0.0]
+
+
+def _0ics_pass_log(kv):
+    n, a, b, c = _0ICS_PASS_ACC
+    logging.getLogger("omlx.scheduler").info(
+        "0ics pass: kv %s, %d passaggi, prima %.2f ms, strati %.2f ms, dopo %.2f ms",
+        kv, n, a * 1000 / n, b * 1000 / n, c * 1000 / n,
+    )
+    _0ICS_PASS_ACC[:] = [0, 0.0, 0.0, 0.0]
+
+
 class Qwen4ExpModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -4092,6 +4121,11 @@ class Qwen4ExpModel(nn.Module):
         if _0ICS_ON[0]:
             mx.eval(hidden_states)
             _tp = time.perf_counter()
+        _pt = _0ICS_PASS and target_verify
+        if _pt:
+            _p0 = time.perf_counter()
+            mx.eval(hidden_states, fa_mask if isinstance(fa_mask, mx.array) else hidden_states)
+            _p1 = time.perf_counter()
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
@@ -4127,6 +4161,9 @@ class Qwen4ExpModel(nn.Module):
             _0ICS_ON[0] = False
             _kv = getattr(cache[self.fa_idx], "offset", "?") if cache[self.fa_idx] is not None else "?"
             _0ics_report(_rows, _kv)
+        if _pt:
+            mx.eval(hidden_states, *(write or ()))
+            _p2 = time.perf_counter()
         mixed = None
         if write is not None:
             # The final mixer applies the last write and returns the residual.
@@ -4157,6 +4194,16 @@ class Qwen4ExpModel(nn.Module):
             mixed = self.hyper_connection_mixer(
                 hidden_states, target_verify=target_verify
             )
+        if _pt:
+            mx.eval(mixed)
+            _p3 = time.perf_counter()
+            acc = _0ICS_PASS_ACC
+            acc[0] += 1
+            acc[1] += _p1 - _p0
+            acc[2] += _p2 - _p1
+            acc[3] += _p3 - _p2
+            if acc[0] >= 50:
+                _0ics_pass_log(getattr(cache[self.fa_idx], "offset", "?"))
         return mixed
 
 
@@ -4205,6 +4252,8 @@ class Qwen4ExpMTPModule(nn.Module):
             ple_layer_ids=[],
         )
         self.layers = [Qwen4ExpDecoderLayer(layer_config, layer_idx=0)]
+        # Plain attribute (not an mx.array): marks the head for _0ICS_MTP_GATHERED.
+        self.layers[0].self_attn._0ics_mtp_head = True
         self.hyper_connection_mixer = Qwen4ExpGatedResidual(
             layer_config,
             use_combine=False,

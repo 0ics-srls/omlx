@@ -2936,6 +2936,22 @@ def _dspark_next_drafts(
     mx.async_eval(state.drafts)
 
 
+# 0ics: OMLX_0ICS_MTP_SYNC=1 waits for the MTP head right after dispatching it and
+# logs every 50 cycles what it costs (fold of the committed tokens, then the draft
+# chain) with the head cache length. Timing only: the sync removes the overlap.
+_0ICS_MTP_SYNC = os.environ.get("OMLX_0ICS_MTP_SYNC") == "1"
+_0ICS_MTP_ACC = [0, 0.0, 0.0]
+
+
+def _0ics_mtp_log(offset):
+    n, fold, chain = _0ICS_MTP_ACC
+    logging.getLogger("omlx.scheduler").info(
+        "0ics mtp: head offset %s, %d cicli, fold %.2f ms, catena %.2f ms",
+        offset, n, fold * 1000 / n, chain * 1000 / n,
+    )
+    _0ICS_MTP_ACC[:] = [0, 0.0, 0.0]
+
+
 def _chain_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -3005,6 +3021,9 @@ def _chain_next_drafts(
     sparse_k = _sparse_top_k(sampler) if procs is None else 0
     coarse = _coarse_draft_head(model) if 0 < sparse_k <= 32 else None
     n = committed.shape[0]
+    if _0ICS_MTP_SYNC:
+        mx.eval(hidden_rows, committed)
+        _m0 = time.perf_counter()
     if coarse is None:
         logits, head_hidden = model.mtp_forward(
             hidden_rows,
@@ -3019,6 +3038,9 @@ def _chain_next_drafts(
             hidden_rows, committed.reshape(1, n), state.mtp_cache
         )
     state.hist_offset += int(n)
+    if _0ICS_MTP_SYNC:
+        mx.eval(head_hidden, *([logits] if logits is not None else []))
+        _m1 = time.perf_counter()
 
     if lookup_drafts:
         # p2 prompt lookup: the head has folded the committed tokens; verify the earlier continuation instead of a chain.
@@ -3089,6 +3111,14 @@ def _chain_next_drafts(
         # host finishes emit bookkeeping; the next cycle's sync finds it
         # materialized.
         mx.async_eval(state.drafts)
+        if _0ICS_MTP_SYNC:
+            mx.eval(state.drafts)
+            _m2 = time.perf_counter()
+            _0ICS_MTP_ACC[0] += 1
+            _0ICS_MTP_ACC[1] += _m1 - _m0
+            _0ICS_MTP_ACC[2] += _m2 - _m1
+            if _0ICS_MTP_ACC[0] >= 50:
+                _0ics_mtp_log(int(getattr(state.mtp_cache[0], "offset", -1)) if state.mtp_cache else -1)
     else:
         # Depth 0 (controller escape hatch): no drafts — the next cycle
         # verifies [next_main] alone, i.e. a plain decode step. The fold
