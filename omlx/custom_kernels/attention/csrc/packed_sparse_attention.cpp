@@ -2,6 +2,7 @@
 #include "omlx/binary_dir.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
 #include <sstream>
@@ -165,9 +166,24 @@ class PackedSparseAttentionPrimitive : public Primitive {
     // longer contexts keep reading packed rows.
     const size_t unpack_bytes =
         size_t(B) * (localL + std::max(pooledL, 1)) * dim * sizeof(uint16_t);
+    // 0ics: the 512 MiB cap ends the unpacked path at 524,288 pooled rows
+    // (dim 512, bf16): prefill beyond that halves (1,700 -> ~800 tok/s on M5
+    // Ultra); the per-query share caps an 8192-token chunk at 640 MiB.
+    // OMLX_0ICS_UNPACK_CAP_MB / OMLX_0ICS_UNPACK_KB_PER_Q raise both (defaults
+    // 512 / 80, unchanged).
+    static const size_t unpack_cap = [] {
+      const char* v = std::getenv("OMLX_0ICS_UNPACK_CAP_MB");
+      const long mb = v ? std::atol(v) : 0;
+      return size_t(mb > 0 ? mb : 512) * 1024 * 1024;
+    }();
+    static const size_t unpack_per_q = [] {
+      const char* v = std::getenv("OMLX_0ICS_UNPACK_KB_PER_Q");
+      const long kb = v ? std::atol(v) : 0;
+      return size_t(kb > 0 ? kb : 80) * 1024;
+    }();
     const size_t unpack_budget = std::min(
-        size_t(512 * 1024 * 1024),
-        std::max(size_t(80 * 1024 * 1024), size_t(qL) * 80 * 1024));
+        unpack_cap,
+        std::max(size_t(80 * 1024 * 1024), size_t(qL) * unpack_per_q));
     const bool unpack_kv = qL >= 256 && unpack_bytes <= unpack_budget;
     if (unpack_kv) {
       base_name += "_unpacked";
