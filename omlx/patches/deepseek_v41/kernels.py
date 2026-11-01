@@ -8,6 +8,7 @@ The matrix fragment layout follows MLX-derived Bonsai kernels (Apple Inc.). No c
 compiled extension is required; compilation/dispatch errors propagate.
 """
 
+import os
 from functools import cache
 
 import mlx.core as mx
@@ -948,6 +949,11 @@ _RADIX_TOPK = r"""
     }
 """
 
+# 0ics: FP32 score budget of a radix query group in MiB. Set, it also keeps the group at
+# _NAX_INDEX_MIN_ROWS or more: with the 64 MiB default the group falls to 63 past 2^18
+# visible keys (524,288 tokens at ratio 2) and the scores leave the tensor units.
+_SCORE_BUDGET_MB = int(os.environ.get("OMLX_0ICS_INDEX_SCORE_MB") or 0)
+
 # Below this many visible keys the tile sort is as fast.
 _RADIX_MIN_KEYS = 4096
 
@@ -1092,7 +1098,9 @@ def _radix_index_topk(
 ):
     """Score bounded query groups, then select with the radix kernel."""
     # At most 64 MiB of FP32 scores per group.
-    group = min(1024, max(1, (64 << 20) // (4 * keys.shape[1])))
+    group = min(1024, max(1, ((_SCORE_BUDGET_MB or 64) << 20) // (4 * keys.shape[1])))
+    if _SCORE_BUDGET_MB:
+        group = max(group, _NAX_INDEX_MIN_ROWS)
     results, block_results, pending = [], [], ()
     for begin in range(0, q.shape[1], group):
         end = min(begin + group, q.shape[1])

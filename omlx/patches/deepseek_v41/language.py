@@ -6,7 +6,10 @@ shared_attn and module buffers, all persistent state belongs to request caches.
 Batch rows are evaluated independently so late admission cannot share history.
 """
 
+import logging
 import math
+import os
+import time
 from contextlib import nullcontext
 from functools import cache, lru_cache
 
@@ -37,6 +40,10 @@ from .hyper_connection import (
     fused_hc_projection,
     sinkhorn,
 )
+# 0ics: per-layer wall time of each prefill chunk (the layer boundary already evals).
+_LAYER_TIMING = os.environ.get("OMLX_0ICS_LAYER_TIMING") == "1"
+_timing_log = logging.getLogger("omlx.0ics.layer_timing")
+
 from .kernels import (
     index_select,
     packed_index_scores,
@@ -1441,6 +1448,8 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # CED tail and 2047/2048 chunk widths, so size classes never
             # reuse). Decode/verify widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
+            layer_times = [] if _LAYER_TIMING and prefill_backpressure else None
+            t_layer = time.perf_counter()
             with prefetch.forward() if prefetch is not None else nullcontext():
                 first = self._next_engram(stage, -1)
                 if prefetch is not None and first is not None:
@@ -1494,6 +1503,10 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                     if prefill_backpressure:
                         mx.eval(h, pre)
                         mx.clear_cache()
+                        if layer_times is not None:
+                            now = time.perf_counter()
+                            layer_times.append(f"{i}:{(now - t_layer) * 1000:.0f}")
+                            t_layer = now
                     else:
                         # The GPU runs this layer while the next one is built.
                         mx.async_eval(h, pre)
@@ -1514,6 +1527,11 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                                 mx.zeros((1, 0), mx.int64) if slot == 6 else empty
                             )
                     rows[j].append(rc[j])
+            if layer_times is not None:
+                _timing_log.info(
+                    "0ics layer ms start=%d width=%d skip_decoder=%s %s",
+                    start, end - begin, skip_decoder, " ".join(layer_times),
+                )
             if skip_decoder:
                 # Cache-only: a skipped chunk has no decoder output to project.
                 width = c.dim if skip_logits else c.vocab_size
