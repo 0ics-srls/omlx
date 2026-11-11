@@ -33,6 +33,7 @@ import inspect
 import itertools
 import json
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -87,6 +88,11 @@ from .qwen3_omni_realtime import Qwen3OmniVoiceBackend
 from .realtime_voice import RealtimeVoiceError, RealtimeVoiceSession
 
 logger = logging.getLogger(__name__)
+_RENDER_CHECK = os.environ.get("OMLX_0ICS_VLM_RENDER_CHECK") == "1"
+# 0ics: OMLX_0ICS_VLM_ONE_RENDER=1 - a text-only request reuses the prepared prompt's ids (#5057) instead of a second
+# render through mlx-vlm (~230 ms at 300k tokens). Only for a model whose two renders give the same ids: checked
+# with OMLX_0ICS_VLM_RENDER_CHECK=1 on GLM-5.3-Flash (tools, thinking in the history, 300k: identical 6/6).
+_ONE_RENDER = os.environ.get("OMLX_0ICS_VLM_ONE_RENDER") == "1"
 
 _VOICE_BACKENDS = {
     "lfm3_audio": LFM3VoiceBackend,
@@ -5566,7 +5572,10 @@ class VLMBatchedEngine(BaseEngine):
         partial = kwargs.pop("is_partial", None)
         # The ids below come from mlx-vlm's own render; the prepared prompt only
         # covers the checks made before generation.
-        kwargs.pop("_prepared_prompt", None)
+        _prepared_0ics = kwargs.pop("_prepared_prompt", None)
+        if _ONE_RENDER and _prepared_0ics is not None and not (images or videos or audio):
+            # the same values _prepare_vision_inputs returns for a text-only request
+            return list(_prepared_0ics[1]), None, None, None, 0, []
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -5622,6 +5631,20 @@ class VLMBatchedEngine(BaseEngine):
             # Free Metal intermediates from vision encoding.
             mx.synchronize()
             mx.clear_cache()
+
+        # 0ics: OMLX_0ICS_VLM_RENDER_CHECK=1 - text-only requests: are the prepared prompt's ids (#5057) the ids of
+        # mlx-vlm's render? Diagnosis only (one render could serve both if they always match).
+        if _RENDER_CHECK and _prepared_0ics is not None and not (images or videos or audio):
+            pronti = list(_prepared_0ics[1])
+            veri = list(token_ids) if not isinstance(token_ids, str) else None
+            if veri is None:
+                logger.info("[render-check] mlx-vlm returned a string prompt, not ids")
+            elif pronti == veri:
+                logger.info("[render-check] identical: %d tokens", len(veri))
+            else:
+                i = next((k for k, (a, b) in enumerate(zip(pronti, veri)) if a != b), min(len(pronti), len(veri)))
+                logger.info("[render-check] DIFFERENT: prepared %d vs mlx-vlm %d tokens, first difference at %d: "
+                            "prepared %s vs mlx-vlm %s", len(pronti), len(veri), i, pronti[i:i + 8], veri[i:i + 8])
 
         return (
             token_ids,

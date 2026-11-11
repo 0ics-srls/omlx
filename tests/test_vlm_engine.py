@@ -1275,6 +1275,59 @@ class TestApplyOcrPrompt:
 class TestProcessChatMessages:
     """Tests for VLMBatchedEngine._process_chat_messages()."""
 
+    # 0ics: OMLX_0ICS_VLM_ONE_RENDER
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_one_render_reuses_prepared_ids_for_text_only(self, mock_extract, monkeypatch):
+        import omlx.engine.vlm as vlm_mod
+
+        monkeypatch.setattr(vlm_mod, "_ONE_RENDER", True)
+        text_msgs = [{"role": "user", "content": "Hello"}]
+        mock_extract.return_value = (text_msgs, [], [])
+        engine = _make_loaded_engine()
+        engine._prepare_vision_inputs = MagicMock(return_value=([9, 9], None, None, None, 0, []))
+
+        result = engine._process_chat_messages(
+            text_msgs, tools=None, kwargs={"_prepared_prompt": ("Hello", [4, 5, 6])}
+        )
+
+        assert result == ([4, 5, 6], None, None, None, 0, [])
+        engine._prepare_vision_inputs.assert_not_called()
+
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_one_render_off_renders_again(self, mock_extract, monkeypatch):
+        import omlx.engine.vlm as vlm_mod
+
+        monkeypatch.setattr(vlm_mod, "_ONE_RENDER", False)
+        text_msgs = [{"role": "user", "content": "Hello"}]
+        mock_extract.return_value = (text_msgs, [], [])
+        engine = _make_loaded_engine()
+        engine._prepare_vision_inputs = MagicMock(return_value=([1, 2, 3], None, None, None, 0, []))
+
+        result = engine._process_chat_messages(
+            text_msgs, tools=None, kwargs={"_prepared_prompt": ("Hello", [4, 5, 6])}
+        )
+
+        assert result[0] == [1, 2, 3]
+        engine._prepare_vision_inputs.assert_called_once()
+
+    @patch("omlx.engine.vlm.extract_images_from_messages")
+    def test_one_render_keeps_the_vlm_render_with_an_image(self, mock_extract, monkeypatch):
+        import omlx.engine.vlm as vlm_mod
+
+        monkeypatch.setattr(vlm_mod, "_ONE_RENDER", True)
+        text_msgs = [{"role": "user", "content": "What is this?"}]
+        mock_extract.return_value = (text_msgs, [object()], [])
+        engine = _make_loaded_engine()
+        engine._prepare_vision_inputs = MagicMock(return_value=([1, 2, 3], None, {}, "h", 0, []))
+        engine._apply_ocr_prompt = MagicMock(side_effect=lambda m: m)
+
+        result = engine._process_chat_messages(
+            text_msgs, tools=None, kwargs={"_prepared_prompt": ("What is this?", [4, 5, 6])}
+        )
+
+        assert result[0] == [1, 2, 3]
+        engine._prepare_vision_inputs.assert_called_once()
+
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_mimo_audio_stays_in_its_original_turn(self, mock_extract):
         engine = _make_loaded_engine(model_type="mimo_v2")
