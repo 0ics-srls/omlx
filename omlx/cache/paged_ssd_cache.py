@@ -16,6 +16,8 @@ Reference: mlx-lm/mlx_lm/models/cache.py (save_prompt_cache, load_prompt_cache)
 
 from __future__ import annotations
 
+import os as _os_0ics
+_SSD_TOUCH = _os_0ics.environ.get("OMLX_0ICS_SSD_TOUCH") == "1"
 import contextlib
 import errno
 import hashlib
@@ -1322,6 +1324,15 @@ class PagedSSDCacheIndex:
                 self._index[block_hash].touch()
                 self._lru.move_to_end(block_hash)
                 self._lru[block_hash] = self._index[block_hash].last_access
+                # 0ics: OMLX_0ICS_SSD_TOUCH=1 moves the block file's mtime too. The startup scan reads recency from the
+                # mtime, so without it a reused block looks as old as its first write and the oldest blocks of a live
+                # long conversation (its prefix) go first after a restart; config/cache-tetto.py, the Mac's one
+                # 100 GB cap across models, orders by it as well.
+                if _SSD_TOUCH:
+                    try:
+                        os.utime(self._index[block_hash].file_path)
+                    except OSError:
+                        pass
 
     def get_lru_entries(self, count: int) -> list[PagedSSDBlockMetadata]:
         """
