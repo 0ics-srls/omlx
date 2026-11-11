@@ -10591,6 +10591,8 @@ class Scheduler:
         if wait is not None:
             if wait.future.done():
                 self._cache_freshness_waits.pop(request.request_id, None)
+                from .fasi_0ics import fase as _fase
+                _fase("scheduler attesa cache in scrittura %s finita (store %s)", request.request_id, wait.store_request_id)
                 try:
                     exc = wait.future.exception()
                 except concurrent.futures.CancelledError:
@@ -10637,6 +10639,9 @@ class Scheduler:
         store_request_id, future, common_prefix = match
         prompt_len = len(request.prompt_token_ids or [])
         timeout = self._CACHE_FRESHNESS_WAIT_TIMEOUT_S
+        from .fasi_0ics import fase as _fase
+        _fase("scheduler attesa cache in scrittura %s: store %s ancora in corso (prefisso comune %d/%d)",
+              request.request_id, store_request_id, common_prefix, prompt_len)
         self._cache_freshness_waits[request.request_id] = _CacheFreshnessWait(
             store_request_id=store_request_id,
             future=future,
@@ -10723,6 +10728,8 @@ class Scheduler:
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
+        from .fasi_0ics import fase as _fase
+        _fase("scheduler ricerca prefisso %s parte", request.request_id)
 
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
         minimum_prefix = (
@@ -10992,6 +10999,8 @@ class Scheduler:
         """
         if request.request_id in self.requests:
             raise ValueError(f"Request {request.request_id} already exists")
+        from .fasi_0ics import fase as _fase
+        _fase("scheduler add_request %s (%d token)", request.request_id, len(request.prompt_token_ids or []))
 
         # Cap the waiting queue so client-side polling can't accumulate
         # unbounded work and the scheduler can apply backpressure via 503.
@@ -15458,9 +15467,12 @@ class Scheduler:
         self._process_pending_aborts()
         self._process_pending_memory_requeue()
 
+        from .fasi_0ics import fase as _fase, ora as _ora
+        _t_r = _ora()
         # Drain a deferred between-turn reclaim requested by the memory
         # enforcer (only acts when the scheduler is idle).
         self._process_pending_reclaim()
+        _t_d = _ora()
 
         # Drain async store_cache completions from prior steps. Each completed
         # entry triggers the deferred batch_generator.remove(uid) on the
@@ -15468,10 +15480,16 @@ class Scheduler:
         drained_async_removes = self._drain_pending_async_removes()
         if drained_async_removes:
             output.has_work = True
+        _t_m = _ora()
 
         # Check memory pressure and evict if needed (tiered cache)
         if self.memory_monitor is not None:
             self._check_memory_pressure()
+        _t_f = _ora()
+        if _t_f - _t_r > 0.1:
+            _fase("scheduler inizio passo lento: reclaim %.1f ms, async_removes %.1f ms (%s), memoria %.1f ms, in attesa %d",
+                  (_t_d - _t_r) * 1000, (_t_m - _t_d) * 1000, drained_async_removes, (_t_f - _t_m) * 1000,
+                  len(self.waiting))
 
         try:
             # Alternate open prefill opportunities so neither admissions nor in-flight chunks starve.

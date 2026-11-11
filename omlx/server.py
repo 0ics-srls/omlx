@@ -7339,6 +7339,8 @@ async def stream_anthropic_messages(
     """
     start_time = time.perf_counter()
     first_token_time = None
+    from .fasi_0ics import fase as _fase_s
+    _fase_s("server stream anthropic parte")
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     accumulated_text = ""
@@ -7953,14 +7955,18 @@ async def _prepare_anthropic_prompt(
 def _count_anthropic_prompt(
     engine: BaseEngine, prompt: _AnthropicPrompt
 ) -> tuple[int, tuple[str, list[int]] | None]:
+    from .fasi_0ics import fase, ora
     try:
-        return _prepare_chat_prompt_for_request(
+        t0 = ora()
+        risultato = _prepare_chat_prompt_for_request(
             engine,
             prompt.messages,
             prompt.tools,
             chat_template_kwargs=prompt.chat_template_kwargs or None,
             is_partial=prompt.is_partial,
         )
+        fase("server conteggio %d token in %.1f ms", risultato[0], (ora() - t0) * 1000)
+        return risultato
     except Exception as e:
         if _is_chat_template_error(e):
             raise HTTPException(status_code=400, detail=f"Chat template error: {e}")

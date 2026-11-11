@@ -518,7 +518,13 @@ class EngineCore:
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
         """
         max_steps = self.config.decode_burst_max_steps
+        from .fasi_0ics import fase as _fase, ora as _ora
+        _t_s = _ora()
         outputs = [self.scheduler.step()]
+        if _ora() - _t_s > 0.15:
+            _fase("engine_core passo lento %.1f ms (in attesa %d, prefilling %d, running %d)", (_ora() - _t_s) * 1000,
+                  len(self.scheduler.waiting), len(getattr(self.scheduler, "prefilling", ()) or ()),
+                  len(self.scheduler.running))
         if max_steps <= 1:
             return outputs
         # Adaptive budget: single active request -> aggressive (nothing else to

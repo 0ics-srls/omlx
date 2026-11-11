@@ -4253,6 +4253,9 @@ class VLMBatchedEngine(BaseEngine):
             if model_type == "unlimited-ocr" and isinstance(prompt, str):
                 prompts = prompt
             # Tokenize text and preprocess images and audio
+            from ..fasi_0ics import fase as _fase, ora as _ora
+            _t_pi = _ora()
+            _fase("vlm template fatto (immagini=%d)", num_images)
             inputs = prepare_inputs(
                 self._processor,
                 images=images if images else None,
@@ -4265,7 +4268,11 @@ class VLMBatchedEngine(BaseEngine):
         pixel_values = inputs.get("pixel_values")
         attention_mask = inputs.get("attention_mask")
 
+        from ..fasi_0ics import fase as _fase, ora as _ora
+        _t_tl = _ora()
         token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
+        _fase("vlm prepare_inputs+tolist %d token, tolist %.1f ms, messaggi con immagini %d",
+              len(token_ids), (_ora() - _t_tl) * 1000, len(image_message_ranges))
         image_cache_key_start = 0
         image_cache_key_ranges: list[Tuple[int, str]] = []
         if image_message_ranges:
@@ -5221,6 +5228,8 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
+        from ..fasi_0ics import fase as _fase, ora as _ora
+        _t_pf = _ora()
         _, text_messages, images, _, videos = self._extract_request_media(messages)
         if (
             images
@@ -5275,11 +5284,14 @@ class VLMBatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
+        _fase("vlm preflight template+encode+immagini %d token in %.1f ms", num_tokens, (_ora() - _t_pf) * 1000)
+        _t_ev = _ora()
         await self._preflight_or_raise_with_eviction(
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
         )
+        _fase("vlm preflight controllo memoria %.1f ms", (_ora() - _t_ev) * 1000)
 
     async def preflight_completion(
         self,
@@ -5330,6 +5342,8 @@ class VLMBatchedEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream chat completion with vision support."""
+        from ..fasi_0ics import fase as _fase0
+        _fase0("vlm stream_chat parte")
         if not self._loaded:
             await self.start()
 
@@ -5373,14 +5387,16 @@ class VLMBatchedEngine(BaseEngine):
             image_hash,
             image_cache_key_start,
             image_cache_key_ranges,
-        ) = await loop.run_in_executor(
+        ) = await (_fase0("vlm stream_chat consegna all'esecutore MLX") or loop.run_in_executor)(
             self._engine._mlx_executor,
-            self._process_chat_messages,
+            self._process_chat_messages_fasi,
             messages,
             tools,
             kwargs,
         )
 
+        from ..fasi_0ics import fase as _fase, ora as _ora
+        _t_dopo = _ora()
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
@@ -5392,6 +5408,7 @@ class VLMBatchedEngine(BaseEngine):
         )
         if system_prefix:
             kwargs["system_prefix_ids"] = system_prefix
+        _fase("vlm specprefill + generation_prompt + system_prefix %.1f ms", (_ora() - _t_dopo) * 1000)
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -5511,6 +5528,15 @@ class VLMBatchedEngine(BaseEngine):
                 field="messages",
             )
         return media_messages, text_messages, images, audio, videos
+
+    def _process_chat_messages_fasi(self, messages, tools, kwargs):
+        from ..fasi_0ics import fase, ora
+        t0 = ora()
+        fase("vlm process_chat_messages parte nell'esecutore MLX")
+        risultato = self._process_chat_messages(messages, tools, kwargs)
+        fase("vlm process_chat_messages %d token in %.1f ms", len(risultato[0]) if not isinstance(risultato[0], str) else -1,
+             (ora() - t0) * 1000)
+        return risultato
 
     def _process_chat_messages(
         self,
