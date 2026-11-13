@@ -9246,7 +9246,6 @@ class TestInkling2OQ:
             "model.safetensors",
             "mtp.safetensors",
             "processor_config.json",
-            "tiktoken",
             "tokenizer.json",
         ]
         assert (output / "mtp.safetensors").read_bytes() == b"draft"
