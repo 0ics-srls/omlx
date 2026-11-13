@@ -54,6 +54,7 @@ from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
@@ -2086,6 +2087,8 @@ class VLMBatchedEngine(BaseEngine):
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
                     )
+                if model_type == "inkling2":
+                    return inkling2_vlm.load(self._model_name)
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
                         self._model_name,
