@@ -1,0 +1,7 @@
+# The git dependencies of the oMLX venv in service on the Mac Studio (ds-0ics 171f6011), each at its commit, read with
+# `uv pip freeze` on 2026-11-19. uv cannot hash a git requirement, so rilascio-0ics.yml builds them as wheels, attaches
+# them to the release and lists them in SHA256SUMS. Regenerate only when a dependency changes.
+mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@8c244a1faff44cfa69e3151c195f52a4c1c90be5
+mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206
+mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d
+mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@138d7617d39653b39a5cbc379b1b5907a4481d67
