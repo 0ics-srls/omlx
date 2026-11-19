@@ -38,6 +38,9 @@ jobs:
       - name: Build the oMLX wheel with the native custom kernels
         env:
           OMLX_WITH_CUSTOM_KERNEL: "1"
+          # The native extensions are arm64 only, while setup-python's Python is universal2: without this the wheel
+          # is tagged universal2 and would claim to run on an Intel Mac.
+          _PYTHON_HOST_PLATFORM: macosx-15.0-arm64
         run: |
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-version
@@ -46,6 +49,7 @@ jobs:
           CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
           export CMAKE_ARGS
           python -m build --wheel --no-isolation
+          ls dist/omlx-*-cp311-*-macosx_*_arm64.whl || { echo "the wheel is not tagged arm64"; exit 1; }
           unzip -l dist/omlx-*.whl | grep -E "_ext|dylib|metallib" || { echo "no native artifacts in wheel"; exit 1; }
           unzip -l dist/omlx-*.whl | grep -q "omlx_web/templates/dashboard.html" || { echo "web UI missing from wheel"; exit 1; }
 
