@@ -41,7 +41,7 @@ jobs:
         with:
           version: "0.13.6"
 
-      # the full tests run on the Mac Studio before every tag (ubuntu-ai: server/costruzione/esegui omlx prima-del-tag): native kernels are tested on real hardware, not on this VM
+      # the full tests (ci/prove-0ics.sh) run on the Mac Studio before every tag (ubuntu-ai: server/costruzione/esegui omlx prima-del-tag): native kernels are tested on real hardware, not on this VM
       - name: Build the oMLX wheel with the native custom kernels
         env:
           OMLX_WITH_CUSTOM_KERNEL: "1"
