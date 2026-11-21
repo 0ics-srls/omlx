@@ -1,4 +1,11 @@
-# Tests already red on the intact upstream oMLX v0.7.3 (9de79bc3), run on the Mac Studio M5 Ultra on 21/11 with
-# ci/prove-0ics.sh in ~/.prove/omlx-monte: ci/prove-0ics.sh deselects them; any other red stops the run.
+# Tests red on the intact upstream oMLX, deselected by ci/prove-0ics.sh: every line names WHY and the open work that removes
+# it. A red not listed here stops the run.
+#
+# GLM-5 Next batched decode across concurrent rows, on the Mac Studio M5 Ultra (21/11): red on the intact v0.7.3 (9de79bc3)
+# AND on upstream main ade9f20a, no commit of ours touches it. The batched kernel sparse_mla_decode_batched is called 0
+# times (expected 12) and batched and single rows differ by ~8e-3 in bf16: on this hardware another path is taken.
+# GLM-5.3 in service is glm5_next but serves one user at a time (catalog da_solo = true), so the batched path does not
+# run today. OPEN: find why the M5 Ultra skips the batched kernel, fix it in main-0ics, measure, then remove these lines
+# (ubuntu-ai docs/motori/MOTORI.md section 6).
 tests/test_glm5_next_mtp.py::test_split_k_batched_decode_matches_rows_alone[lengths0]
 tests/test_glm5_next_mtp.py::test_split_k_batched_decode_matches_rows_alone[lengths1]
