@@ -19,6 +19,7 @@ import os
 import re
 import tempfile
 import uuid
+from enum import StrEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import AsyncIterator, Optional
@@ -32,7 +33,12 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import (
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from PIL import Image
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
@@ -522,8 +528,11 @@ async def create_transcription(
 ):
     """OpenAI-compatible audio transcription endpoint (Speech-to-Text).
 
-    Note: ``response_format`` and ``temperature`` are accepted for OpenAI API
-    compatibility but are not yet implemented — they are silently ignored.
+    ``response_format`` follows OpenAI's audio API (0ics): ``json`` returns
+    only ``{"text"}``, ``verbose_json`` adds ``language``, ``duration`` and
+    ``segments``, ``text``/``srt``/``vtt`` return plain text; ``diarized_json``
+    (no model here separates speakers) and unknown values are a 400.
+    ``temperature`` is accepted for compatibility and ignored.
 
     ``stream=true`` switches the response to OpenAI's transcription SSE
     format: ``transcript.text.delta`` events with incremental text followed
@@ -551,6 +560,8 @@ async def create_transcription(
     """
     from omlx.engine.stt import STTEngine
     from omlx.exceptions import ModelNotFoundError
+
+    formato = _formato_trascrizione(response_format)
 
     pool = _get_engine_pool()
     resolved_model = _resolve_model(model)
@@ -647,13 +658,74 @@ async def create_transcription(
 
     # Build response directly from the dict returned by STTEngine
     segments = result.get("segments") or None
+    text = result.get("text", "")
 
+    if formato is FormatoTrascrizione.JSON:
+        return JSONResponse({"text": text})
+    if formato is not FormatoTrascrizione.VERBOSE_JSON:
+        return PlainTextResponse(_trascrizione_come_testo(formato, text, segments or []))
     return AudioTranscriptionResponse(
-        text=result.get("text", ""),
+        text=text,
         language=result.get("language"),
         duration=result.get("duration"),
         segments=segments,
     )
+
+
+class FormatoTrascrizione(StrEnum):
+    """The response_format values of OpenAI's audio transcription API (0ics)."""
+
+    JSON = "json"
+    TEXT = "text"
+    SRT = "srt"
+    VERBOSE_JSON = "verbose_json"
+    VTT = "vtt"
+    DIARIZED_JSON = "diarized_json"
+
+
+def _formato_trascrizione(response_format: str) -> FormatoTrascrizione:
+    """The requested format, or a 400 naming the value the API does not serve."""
+    try:
+        formato = FormatoTrascrizione(response_format)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"response_format {response_format!r} is not supported: "
+            f"use one of {', '.join(f.value for f in FormatoTrascrizione if f is not FormatoTrascrizione.DIARIZED_JSON)}",
+        ) from None
+    if formato is FormatoTrascrizione.DIARIZED_JSON:
+        raise HTTPException(
+            status_code=400,
+            detail="response_format 'diarized_json' needs a model that separates speakers",
+        )
+    return formato
+
+
+def _tempo(secondi: float, separatore: str) -> str:
+    """HH:MM:SS<sep>mmm, the time of SRT (',') and WebVTT ('.')."""
+    millesimi = round(secondi * 1000)
+    ore, resto = divmod(millesimi, 3_600_000)
+    minuti, resto = divmod(resto, 60_000)
+    sec, ms = divmod(resto, 1000)
+    return f"{ore:02d}:{minuti:02d}:{sec:02d}{separatore}{ms:03d}"
+
+
+def _trascrizione_come_testo(formato: FormatoTrascrizione, testo: str, segmenti: list[dict]) -> str:
+    """The transcription as text, SRT or WebVTT; without segments, one cue for the whole text."""
+    if formato is FormatoTrascrizione.TEXT:
+        return testo
+    vtt = formato is FormatoTrascrizione.VTT
+    righe = ["WEBVTT", ""] if vtt else []
+    separatore = "." if vtt else ","
+    for numero, segmento in enumerate(segmenti or [{"start": 0.0, "end": 0.0, "text": testo}], start=1):
+        if not vtt:
+            righe.append(str(numero))
+        righe += [
+            f"{_tempo(segmento['start'], separatore)} --> {_tempo(segmento['end'], separatore)}",
+            segmento["text"].strip(),
+            "",
+        ]
+    return "\n".join(righe) + "\n"
 
 
 def _lfm3_speech(engine):

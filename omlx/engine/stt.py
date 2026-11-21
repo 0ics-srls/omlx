@@ -174,6 +174,14 @@ def _validate_stt_processor(model_name: str, model: Any) -> None:
     raise RuntimeError(_missing_processor_hint(model_name))
 
 
+def _audio_duration(audio_path: str) -> float:
+    """The length of the audio in seconds (0ics): OpenAI's ``duration``, not the
+    model's ``total_time`` (the time the transcription took)."""
+    from mlx_audio.stt.utils import SAMPLE_RATE  # the rate load_audio resamples to
+
+    return len(_load_audio_samples(audio_path)) / SAMPLE_RATE
+
+
 def _load_audio_samples(audio_path: str) -> np.ndarray:
     """Load an audio file as 16 kHz mono float32 samples."""
     from mlx_audio.stt.utils import load_audio
@@ -778,16 +786,14 @@ class STTEngine(BaseNonStreamingEngine):
                     "text": result.text or "",
                     "language": raw_lang,
                     "segments": segments,
-                    "duration": getattr(
-                        result, "total_time", 0.0
-                    ),
+                    "duration": _audio_duration(audio_path),
                 }
             # Fallback for unexpected return types
             return {
                 "text": str(result),
                 "language": language,
                 "segments": [],
-                "duration": 0.0,
+                "duration": _audio_duration(audio_path),
             }
 
         activity_id = self._begin_activity(

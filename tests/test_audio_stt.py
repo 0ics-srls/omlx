@@ -813,6 +813,100 @@ class TestSTTEndpointResponseFormat:
         assert "application/json" in response.headers.get("content-type", "")
 
 
+# 0ics: response_format as OpenAI's audio API defines it (json, text, srt, verbose_json, vtt, diarized_json)
+_TWO_SEGMENTS = [
+    {"id": 0, "start": 0.0, "end": 1.25, "text": " hello"},
+    {"id": 1, "start": 1.25, "end": 2.5, "text": " world"},
+]
+
+
+def _transcribe_as(server_audio_client, response_format: str):
+    client, pool = server_audio_client
+    engine = _make_mock_stt_engine()
+    engine.transcribe = AsyncMock(return_value={
+        "text": "hello world",
+        "language": "en",
+        "duration": 2.5,
+        "segments": _TWO_SEGMENTS,
+    })
+    pool.get_engine = AsyncMock(return_value=engine)
+    return client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+        data={"model": "whisper-tiny", "response_format": response_format},
+    )
+
+
+class TestSTTEndpointEveryResponseFormat:
+    """Each response_format answers as OpenAI's audio API says."""
+
+    def test_json_returns_only_the_text(self, server_audio_client):
+        response = _transcribe_as(server_audio_client, "json")
+        assert response.status_code == 200
+        assert response.json() == {"text": "hello world"}
+
+    def test_verbose_json_returns_language_duration_segments(self, server_audio_client):
+        response = _transcribe_as(server_audio_client, "verbose_json")
+        assert response.status_code == 200
+        body = response.json()
+        assert (body["text"], body["language"], body["duration"]) == ("hello world", "en", 2.5)
+        assert [s["text"] for s in body["segments"]] == [" hello", " world"]
+
+    def test_text_returns_plain_text(self, server_audio_client):
+        response = _transcribe_as(server_audio_client, "text")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+        assert response.text == "hello world"
+
+    def test_srt_numbers_the_segments_with_srt_times(self, server_audio_client):
+        response = _transcribe_as(server_audio_client, "srt")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+        assert response.text == (
+            "1\n00:00:00,000 --> 00:00:01,250\nhello\n\n"
+            "2\n00:00:01,250 --> 00:00:02,500\nworld\n\n"
+        )
+
+    def test_vtt_starts_with_webvtt_and_dot_times(self, server_audio_client):
+        response = _transcribe_as(server_audio_client, "vtt")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+        assert response.text == (
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:01.250\nhello\n\n"
+            "00:00:01.250 --> 00:00:02.500\nworld\n\n"
+        )
+
+    def test_an_unknown_response_format_is_400(self, server_audio_client):
+        response = _transcribe_as(server_audio_client, "pdf")
+        assert response.status_code == 400
+        assert "pdf" in response.text
+
+    def test_diarized_json_without_speakers_is_400(self, server_audio_client):
+        response = _transcribe_as(server_audio_client, "diarized_json")
+        assert response.status_code == 400
+        assert "diarized_json" in response.text
+
+
+class TestSTTEngineDuration:
+    """duration is the length of the audio, not the time the model took."""
+
+    @pytest.mark.asyncio
+    async def test_the_duration_is_the_audio_length(self, tmp_path):
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                return SimpleNamespace(text="hello", language="en", segments=[], total_time=0.02)
+
+        audio_path = tmp_path / "half-second.wav"
+        audio_path.write_bytes(_make_wav_bytes(0.5))
+        engine = STTEngine("whisper-tiny")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(str(audio_path))
+
+        assert result["duration"] == pytest.approx(0.5, abs=0.01)
+
+
 # ---------------------------------------------------------------------------
 # TestSTTEndpointErrors
 # ---------------------------------------------------------------------------
