@@ -19,10 +19,11 @@ import os
 import re
 import tempfile
 import uuid
+from collections.abc import AsyncIterator
 from enum import StrEnum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import AsyncIterator, Optional
+from typing import Annotated
 
 from fastapi import (
     APIRouter,
@@ -217,7 +218,7 @@ async def _read_upload(file: UploadFile) -> bytes:
     return b"".join(chunks)
 
 
-def _decode_ref_audio_base64(request: AudioSpeechRequest) -> Optional[bytes]:
+def _decode_ref_audio_base64(request: AudioSpeechRequest) -> bytes | None:
     """Validate and decode optional base64 ref_audio from a TTS request."""
     if request.ref_audio is None:
         return None
@@ -243,27 +244,22 @@ def _decode_ref_audio_base64(request: AudioSpeechRequest) -> Optional[bytes]:
         raise HTTPException(
             status_code=400,
             detail="Invalid base64 encoding in 'ref_audio' field",
-        )
+        ) from None
 
 
-def _write_ref_audio_tempfile(audio_bytes: Optional[bytes]) -> Optional[str]:
+def _write_ref_audio_tempfile(audio_bytes: bytes | None) -> str | None:
     """Persist decoded ref audio to a temp file if present."""
     if audio_bytes is None:
         return None
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    try:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(audio_bytes)
         return tmp.name
-    finally:
-        tmp.close()
 
 
-def _cleanup_tempfile(path: Optional[str]) -> None:
+def _cleanup_tempfile(path: str | None) -> None:
     if path and os.path.exists(path):
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(path)
-        except OSError:
-            pass
 
 
 def _resolve_tts_streaming_interval(request: AudioSpeechRequest) -> float:
@@ -346,7 +342,7 @@ def _split_tts_text(text: str, max_chars: int = 300) -> list[str]:
 async def _stream_speech_response(
     engine,
     request: AudioSpeechRequest,
-    ref_audio_path: Optional[str],
+    ref_audio_path: str | None,
     streaming_interval: float,
 ) -> AsyncIterator[bytes]:
     """Stream sentence-level TTS as a single WAV header plus PCM chunks."""
@@ -360,7 +356,7 @@ async def _stream_speech_response(
                 "TTS native streaming start: model=%s, text_len=%d, voice=%s, language=%s",
                 request.model, len(request.input), request.voice, request.language or "auto",
             )
-            stream_format: Optional[tuple[int, int, int]] = None
+            stream_format: tuple[int, int, int] | None = None
             try:
                 async for sample_rate, channels, sample_width, pcm_bytes in engine.stream_synthesize_pcm(
                     request.input,
@@ -409,7 +405,7 @@ async def _stream_speech_response(
             request.model, len(request.input), len(segments), request.voice, request.language or "auto",
         )
 
-        stream_format: Optional[tuple[int, int, int]] = None
+        stream_format: tuple[int, int, int] | None = None
         for idx, segment in enumerate(segments, start=1):
             wav_bytes = await engine.synthesize(
                 segment,
@@ -516,14 +512,14 @@ async def _stream_transcription_events(
 
 @router.post("/v1/audio/transcriptions", response_model=AudioTranscriptionResponse)
 async def create_transcription(
-    file: UploadFile = File(...),
+    file: Annotated[UploadFile, File()],
     model: str = Form(...),
-    language: Optional[str] = Form(None),
-    prompt: Optional[str] = Form(None),
+    language: str | None = Form(None),
+    prompt: str | None = Form(None),
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
     stream: bool = Form(False),
-    max_tokens: Optional[int] = Form(None, gt=0),
+    max_tokens: int | None = Form(None, gt=0),
     word_timestamps: bool = Form(False),
 ):
     """OpenAI-compatible audio transcription endpoint (Speech-to-Text).
@@ -649,10 +645,8 @@ async def create_transcription(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
 
     _record_audio_request(resolved_model)
 
@@ -733,7 +727,7 @@ def _lfm3_speech(engine):
     return engine.speech if isinstance(engine, VLMBatchedEngine) else None
 
 
-def _verify_ws_api_key(websocket: WebSocket, api_key: Optional[str]) -> bool:
+def _verify_ws_api_key(websocket: WebSocket, api_key: str | None) -> bool:
     """Verify an in-band API key, including the manual inference opt-in.
 
     WebSocket connections from browsers cannot carry an Authorization
@@ -781,7 +775,7 @@ async def realtime_transcription(websocket: WebSocket) -> None:
 
     try:
         start = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         await _reject("Handshake timeout")
         return
     except WebSocketDisconnect:
@@ -1514,7 +1508,7 @@ async def _run_realtime_voice(
 
 
 @router.get("/v1/audio/voices")
-async def list_model_voices(model: Optional[str] = None, realtime: bool = False):
+async def list_model_voices(model: str | None = None, realtime: bool = False):
     """List built-in speaker/voice names for a TTS model.
 
     With ``realtime=true`` it lists the voices a /v1/realtime session on the
@@ -1709,7 +1703,7 @@ async def create_speech(request: AudioSpeechRequest):
 
 @router.post("/v1/audio/process")
 async def process_audio(
-    file: UploadFile = File(...),
+    file: Annotated[UploadFile, File()],
     model: str = Form(...),
 ):
     """Audio processing endpoint (speech enhancement, source separation, STS).
@@ -1764,10 +1758,8 @@ async def process_audio(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
 
     _record_audio_request(resolved_model)
 
