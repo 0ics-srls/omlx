@@ -13,7 +13,11 @@ venv="$1"; shift
 cd "$(dirname "$0")/.."
 
 uv venv -q --allow-existing --python 3.11 "$venv"
-uv pip install -q --python "$venv/bin/python" -e ".[mcp]" "pytest<9.2" pytest-asyncio pytest-xdist
+# the native custom kernels, built as the release wheel builds them (OMLX_WITH_CUSTOM_KERNEL=1): without them the tests
+# exercise another oMLX than the one in service (on a NAX GPU the fused sparse decode paths need dsa_topk_indices);
+# --reinstall-package rebuilds them from this tree every run
+OMLX_WITH_CUSTOM_KERNEL=1 uv pip install -q --python "$venv/bin/python" --reinstall-package omlx -e ".[mcp]" \
+  "pytest<9.2" pytest-asyncio pytest-xdist
 
 gia_rossi=()
 if [ -f ci/non-verdi-v0.7.3.txt ]; then
