@@ -24,6 +24,12 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      # one branch for this fork: a new upstream base is merged into main-0ics, never a parallel branch
+      - name: The tag is on main-0ics
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main-0ics
 
       - name: Set up Python 3.11
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -131,4 +137,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-            --notes "oMLX ds-0ics for the Mac Studio: wheel with native kernels (Python 3.11), git dependency wheels, requisiti.txt with hashes, SHA256SUMS."
+            --notes "oMLX main-0ics for the Mac Studio: wheel with native kernels (Python 3.11), git dependency wheels, requisiti.txt with hashes, SHA256SUMS."
