@@ -41,6 +41,10 @@ jobs:
         with:
           version: "0.13.6"
 
+      # the same script ubuntu-ai's esegui runs on the Mac Studio: no wheel from a tree whose own tests are red
+      - name: oMLX's own tests (ci/prove-0ics.sh)
+        run: bash ci/prove-0ics.sh "$RUNNER_TEMP/venv-prove"
+
       - name: Build the oMLX wheel with the native custom kernels
         env:
           OMLX_WITH_CUSTOM_KERNEL: "1"
