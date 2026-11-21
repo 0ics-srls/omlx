@@ -1,5 +1,5 @@
 # actionlint 1.7.7 (the version the 0ics release rules pin) predates the GitHub-hosted macos-26 label that
-# rilascio-0ics.yml, like build-wheels.yml, runs on: declare it here so the label check passes.
+# rilascio-0ics.yml runs on: declare it here so the label check passes.
 self-hosted-runner:
   labels:
     - macos-26

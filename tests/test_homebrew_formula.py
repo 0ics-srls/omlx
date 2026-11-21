@@ -29,9 +29,6 @@ from pathlib import Path
 import pytest
 
 FORMULA_PATH = Path(__file__).resolve().parents[1] / "Formula" / "omlx.rb"
-WORKFLOW_PATH = (
-    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "update-formula.yml"
-)
 
 MACOS_27_GUARD = 'MacOS.version >= "27"'
 SPACY_MODEL_SHA256 = "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
@@ -42,23 +39,8 @@ def formula() -> str:
     return FORMULA_PATH.read_text()
 
 
-@pytest.fixture(scope="module")
-def formula_update_workflow() -> str:
-    return WORKFLOW_PATH.read_text()
-
-
+# 0ics: the test of upstream's Homebrew release workflow left the fork together with that workflow
 class TestFormulaReleaseUpdate:
-    def test_source_sha_update_is_scoped_to_top_level(self, formula_update_workflow):
-        """Release bumps must not replace checksums inside resource blocks."""
-        sha_update = next(
-            line.strip()
-            for line in formula_update_workflow.splitlines()
-            if line.lstrip().startswith("sed -i") and "steps.sha.outputs.sha256" in line
-        )
-
-        assert "s|^  sha256" in sha_update
-        assert '"$|  sha256' in sha_update
-
     def test_spacy_model_checksum_is_independent(self, formula):
         """The bundled spaCy wheel checksum must survive source version bumps."""
         resource_start = formula.index('resource "en-core-web-sm" do')
