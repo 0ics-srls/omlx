@@ -6,6 +6,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
+from . import attn_decode
 
 # Upper bound on one additive mask block (elements) in the general attention
 # path; queries are split into sub-blocks so the mask stays below it.
@@ -320,15 +321,21 @@ _flash_kernel = None
 _FLASH_MIN_QUERIES = 32
 
 
-def _use_flash(length: int, window: int) -> bool:
+def _use_flash(length: int, window: int, keys: int) -> bool:
     """Prefill blocks take the flash kernel on the GPU.
 
     On hosts with tensor units (NAX) MLX's masked SDPA runs on them, which
     this kernel does not; there only sliding layers, whose cost is dominated
-    by building the mask, switch to it.
+    by building the mask, switch to it. 0ics: with ``OMLX_0ICS_INKLING_ATTN=1``
+    the global layers switch too from ``attn_decode.FLASH_MIN_KEYS`` keys, where
+    the masked path's copy of the cache and its mask cost more than the tensor
+    units give (M5 Ultra, 512-query chunk: 121.6 against 101.2 ms at 128K, 1,227
+    ms and +28 GB against 413 ms and +0 GB at 512K).
     """
     if length < _FLASH_MIN_QUERIES or mx.default_device() != mx.gpu:
         return False
+    if attn_decode.enabled() and keys >= attn_decode.FLASH_MIN_KEYS:
+        return True
     return bool(window) or not is_nax_available()
 
 
@@ -396,9 +403,13 @@ def banded_sink_attention(
     keys to d < window (sliding layers use window == R).
     """
     b, length = q.shape[0], q.shape[2]
+    # 0ics OMLX_0ICS_INKLING_ATTN=1: global layers' decode and verify split over the keys (attn_decode.py)
+    if (attn_decode.enabled() and attn_decode.supports(q, window, left_padding, k.shape[2])
+            and attn_decode.supports_cache(k, v)):
+        return attn_decode.attention(q, k, v, rel, sink, scale=scale)
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
-    if q.dtype == mx.bfloat16 and _use_flash(length, window):
+    if q.dtype == mx.bfloat16 and _use_flash(length, window, k.shape[2]):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )

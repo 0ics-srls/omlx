@@ -23,7 +23,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
-from . import kernels
+from . import kernels, window_cache
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -780,6 +780,16 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
+        # 0ics OMLX_0ICS_INKLING_WINDOW=1: the sliding layers keep only their window (window_cache.py)
+        args = self.args.text
+        if window_cache.window_enabled(args.sliding_window_size):
+            return [
+                CacheList(
+                    window_cache.WindowKVCache() if args.is_sliding(i) else KVCache(),
+                    ArraysCache(4),
+                )
+                for i in range(len(self.model.layers))
+            ]
         return [CacheList(KVCache(), ArraysCache(4)) for _ in self.model.layers]
 
     def sanitize(self, weights: dict) -> dict:
