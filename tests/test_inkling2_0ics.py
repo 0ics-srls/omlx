@@ -229,3 +229,21 @@ def test_window_cache_handlers_are_registered():
     batch = window_cache.WindowKVCache.merge([window_cache.WindowKVCache(), window_cache.WindowKVCache()])
     assert type(batch).__name__ == "BatchWindowKVCache"
     assert not CacheTypeRegistry.get_handler_by_class_name(type(batch).__name__).supports_block_slicing
+
+
+@pytest.mark.parametrize("window", [0, WINDOW])
+def test_gqa_flash_equals_the_upstream_flash_kernel_bit_for_bit(window):
+    from omlx.patches.inkling2 import attn_prefill, kernels
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("the flash kernels run on the GPU")
+    length, keys = 100, 2600
+    q, _, _, rel, sink = _chunk(length, 51, 1024)
+    k = _unit((1, HKV, keys, D), 52)
+    mx.random.seed(53)
+    v = mx.random.normal((1, HKV, keys, D)).astype(mx.bfloat16)
+    scale = D**-0.5
+    ref = kernels.flash_banded_attention(q, k, v, rel, sink, scale=scale, window=window)
+    for bq in (16, 32):
+        out = attn_prefill.flash_gqa(q, k, v, rel, sink, scale=scale, window=window, bq=bq)
+        assert mx.array_equal(out, ref)

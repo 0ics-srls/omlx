@@ -6,7 +6,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
-from . import attn_decode
+from . import attn_decode, attn_prefill
 
 # Upper bound on one additive mask block (elements) in the general attention
 # path; queries are split into sub-blocks so the mask stays below it.
@@ -329,8 +329,8 @@ def _use_flash(length: int, window: int, keys: int) -> bool:
     by building the mask, switch to it. 0ics: with ``OMLX_0ICS_INKLING_ATTN=1``
     the global layers switch too from ``attn_decode.FLASH_MIN_KEYS`` keys, where
     the masked path's copy of the cache and its mask cost more than the tensor
-    units give (M5 Ultra, 512-query chunk: 121.6 against 101.2 ms at 128K, 1,227
-    ms and +28 GB against 413 ms and +0 GB at 512K).
+    units give (M5 Ultra, 512-query chunk: 122.9 ms and +7.1 GB against 85.8 at
+    128K, 1,227 ms and +28 GB against 346 at 512K, with attn_prefill.flash_gqa).
     """
     if length < _FLASH_MIN_QUERIES or mx.default_device() != mx.gpu:
         return False
@@ -410,6 +410,11 @@ def banded_sink_attention(
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
     if q.dtype == mx.bfloat16 and _use_flash(length, window, k.shape[2]):
+        if attn_decode.enabled():
+            # 0ics: the heads of a GQA group in one threadgroup, same result bit for bit (attn_prefill.py)
+            return attn_prefill.flash_gqa(
+                q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
+            )
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )
