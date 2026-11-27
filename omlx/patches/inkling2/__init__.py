@@ -21,6 +21,10 @@ def apply_inkling2_patch() -> bool:
         return False
     sys.modules[_QUALNAME] = model
     importlib.import_module("mlx_lm.models").inkling2 = model
+    # 0ics: the sliding-window caches round-trip through the prefix cache
+    from . import cache_handlers
+
+    cache_handlers.register()
     return True
 
 

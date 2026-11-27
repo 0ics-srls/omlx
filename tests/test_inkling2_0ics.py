@@ -177,3 +177,55 @@ def test_flash_kernel_on_a_global_layer_matches_the_masked_path():
     ref = kernels._masked_attention(q, k, v, rel, sink, scale, 0, None)
     out = kernels.flash_banded_attention(q, k, v, rel, sink, scale=scale, window=0)
     assert float(mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max()) < 2e-3
+
+
+def _feed(caches, steps, seed):
+    """Append the same chunks to every cache; return the sliding-layer attention outputs of the last chunk."""
+    from omlx.patches.inkling2 import kernels
+
+    outs = None
+    for length in steps:
+        seed += 13
+        q, k, v, rel, sink = _chunk(length, seed, WINDOW)
+        outs = []
+        for cache in caches:
+            kk, vv = cache.update_and_fetch(k, v)
+            outs.append(kernels.banded_sink_attention(q, kk, vv, rel, sink, scale=D**-0.5, window=WINDOW))
+    return outs, seed
+
+
+@pytest.mark.parametrize("prefix", [[512] * 3, [512] * 5 + [300], [512, 77, 1, 1, 1, 512, 512, 333]])
+def test_window_cache_prefix_round_trip_is_exact(prefix):
+    """Stored through its prefix-cache handler and rebuilt, a window cache continues exactly as the full cache."""
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.cache.type_registry import CacheTypeRegistry
+    from omlx.patches.inkling2 import cache_handlers, window_cache
+
+    cache_handlers.register()
+    full, win = KVCache(), window_cache.WindowKVCache()
+    _, seed = _feed([full, win], prefix, 100)
+    handler = CacheTypeRegistry.get_handler_by_class_name(type(win).__name__)
+    assert not handler.supports_block_slicing
+    elements = handler.serialize_state(win)
+    assert elements[0].shape[2] <= window_cache.KEEP + window_cache.ALIGN
+    restored = handler.deserialize_state(tuple(elements), handler.serialize_meta_state(win))
+    assert type(restored) is window_cache.WindowKVCache
+    outs, _ = _feed([full, win, restored], [512, 1, 1, 5, 300, 512], seed)
+    assert mx.array_equal(outs[0], outs[1]) and mx.array_equal(outs[0], outs[2])
+
+
+def test_window_cache_handlers_are_registered():
+    from mlx_lm.models.cache import ArraysCache, CacheList
+
+    from omlx.cache.type_registry import CacheTypeRegistry
+    from omlx.patches.inkling2 import cache_handlers, window_cache
+
+    cache_handlers.register()
+    names = CacheTypeRegistry.list_known_class_names()
+    assert "WindowKVCache" in names and "BatchWindowKVCache" in names
+    layer = CacheList(window_cache.WindowKVCache(), ArraysCache(4))
+    assert not CacheTypeRegistry.is_sliceable(layer.caches[0])
+    batch = window_cache.WindowKVCache.merge([window_cache.WindowKVCache(), window_cache.WindowKVCache()])
+    assert type(batch).__name__ == "BatchWindowKVCache"
+    assert not CacheTypeRegistry.get_handler_by_class_name(type(batch).__name__).supports_block_slicing

@@ -85,6 +85,12 @@ class BatchWindowKVCache(BatchKVCache):
             self.left_padding = mx.maximum(self.left_padding - drop, 0)
         return super().update_and_fetch(keys, values)
 
+    @classmethod
+    def merge(cls, caches):
+        merged = super().merge(caches)
+        # mlx-lm builds the empty case as a plain BatchKVCache, which would let the layer grow with the prompt
+        return merged if type(merged) is cls else cls([0] * len(caches))
+
     def extract(self, idx):
         base = super().extract(idx)
         single = WindowKVCache()

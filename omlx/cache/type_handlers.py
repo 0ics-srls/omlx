@@ -45,6 +45,9 @@ class CacheType(Enum):
     QWEN4_QSA_KVCACHE = "QSAKVCache"
     QWEN4_QSA_QUANTIZED_KVCACHE = "QSAQuantizedKVCache"
     QWEN4_BATCH_QSA_KVCACHE = "BatchQSAKVCache"
+    # 0ics: Inkling 2 sliding-window caches (patches/inkling2/window_cache.py, handlers in cache_handlers.py)
+    INKLING2_WINDOW_KVCACHE = "WindowKVCache"
+    INKLING2_BATCH_WINDOW_KVCACHE = "BatchWindowKVCache"
 
 
 @dataclass
@@ -808,13 +811,13 @@ class SizedArraysCache:
         """Delegate to inner cache."""
         return self._inner.finalize()
 
-    def advance(self, N):
+    def advance(self, n):
         """Delegate to inner cache."""
-        return self._inner.advance(N)
+        return self._inner.advance(n)
 
-    def make_mask(self, N):
+    def make_mask(self, n):
         """Delegate to inner cache."""
-        return self._inner.make_mask(N)
+        return self._inner.make_mask(n)
 
     def filter(self, batch_indices):
         """Delegate to inner cache."""
