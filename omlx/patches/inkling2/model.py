@@ -610,6 +610,7 @@ class Inkling2TextModel(nn.Module):
         ]
         self.final_input = AttnResQuery(args.hidden_size, 1)
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self._sliding = [args.is_sliding(i) for i in range(args.num_hidden_layers)]
 
     def __call__(self, inputs, cache=None, input_embeddings=None, capture=None):
         """``capture`` maps draft feature ids to fill: ``i`` < num layers is
@@ -621,6 +622,9 @@ class Inkling2TextModel(nn.Module):
             h = self.embed_norm(self.embed(inputs))
         if cache is None:
             cache = [None] * len(self.layers)
+        else:
+            # 0ics: window caches rebuilt by the prefix cache start at the global layers' position
+            window_cache.realign(cache, self._sliding)
         blocks: list = []
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             if capture is not None and i in capture:
