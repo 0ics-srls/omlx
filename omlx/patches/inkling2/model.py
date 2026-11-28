@@ -23,7 +23,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
-from . import kernels, window_cache
+from . import fused_decode, kernels, window_cache
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -574,6 +574,17 @@ class Inkling2Layer(nn.Module):
             if s is None:
                 s = mx.zeros((b, self._conv_k - 1, width), dtype=mx.float32)
             states.append(s)
+        if fused_decode.enabled() and fused_decode.supports(self, length):
+            # 0ics OMLX_0ICS_INKLING_FUSED=1: the glue between the matmuls in four kernels (fused_decode.py)
+            h, windows = fused_decode.layer_forward(self, h, blocks, kv, states)
+            if conv is not None:
+                if length > 1:
+                    conv._omlx_verify_xp = dict(enumerate(windows))
+                keep = self._conv_k - 1
+                for slot, window in enumerate(windows):
+                    # a view: a short input's window is only keep + length rows
+                    conv[slot] = window[:, -keep:]
+            return h
         tau = self.attn.log_tau(kv, length)
         compiled = length <= _COMPILED_MAX_TOKENS
         pre = self._pre_compiled if compiled else self._pre

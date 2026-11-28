@@ -33,8 +33,6 @@ _BK = 32
 _THREADS = 256
 _MAX_SPLITS = 128
 _MIN_CHUNK = 256
-_LOG2E = 1.4426950408889634
-_LN2 = 0.6931471805599453
 
 _SOURCE = """
     constexpr int GQ = HQ / HKV;
@@ -50,7 +48,7 @@ _SOURCE = """
     const int S = dims[0];
     const int CH = dims[1];
     const int NS = dims[2];
-    const int k_lo = split * CH;
+    const int k_lo = dims[3] + split * CH;
     const int k_hi = min(S, k_lo + CH);
     const float qscale = scale[0] * LOG2E;
 
@@ -128,7 +126,7 @@ _SOURCE = """
             const int qh = hk * GQ + r / L;
             const int l = r % L;
             const int d = (S - L + l) - key;
-            const bool vis = key < k_hi && d >= 0;
+            const bool vis = key < k_hi && d >= 0 && (W == 0 || d < W);
             float s = 0.0f;
             const threadgroup half* qr = Qs + r * D;
             const threadgroup half* kr = Ks + int(lane) * LDK;
@@ -200,7 +198,7 @@ _MMA_SOURCE = """
     const int S = dims[0];
     const int CH = dims[1];
     const int NS = dims[2];
-    const int k_lo = split * CH;
+    const int k_lo = dims[3] + split * CH;
     const int k_hi = min(S, k_lo + CH);
     const short qid = lane / 4;
     const short fm = (qid & 4) + ((lane / 2) % 4);
@@ -292,7 +290,7 @@ _MMA_SOURCE = """
             for (int e = 0; e < 2; ++e) {
                 const int key = k0 + kb * 8 + fn + e;
                 const int d = a_row - key;
-                const bool vis = row_ok && key < k_hi && d >= 0;
+                const bool vis = row_ok && key < k_hi && d >= 0 && (W == 0 || d < W);
                 float sc = Sf[kb].thread_elements()[e] * qscale;
                 if (vis) {
                     if (d < R) {
@@ -348,8 +346,46 @@ _MMA_SOURCE = """
     }
 """
 
+# One threadgroup of D threads per row (key/value head hk, row r = g * L + l): the slices' partials combined with the
+# sink, as a zero-value logit, into the row's output; with a gate, the output projection's input
+# ``out * sigmoid(gate)`` [1, L, HQ * D] (``Inkling2Attention.output``), else the attention [1, HQ, L, D].
+_COMBINE_SOURCE = """
+    constexpr int GQ = HQ / HKV;
+    constexpr int NR = GQ * L;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const int t = threadgroup_position_in_grid.x;
+    const int d = thread_position_in_threadgroup.x;
+    const int hk = t / NR;
+    const int r = t % NR;
+    const int l = r % L;
+    const int qh = hk * GQ + r / L;
+    const int NS = dims[2];
+    const float sk = float(sink[l * sink_strides[1] + qh * sink_strides[2]]) * LOG2E;
+    const device float* pm = part_m + (size_t)t * NS;
+    const device float* pl = part_l + (size_t)t * NS;
+    const device float* po = part_o + (size_t)t * NS * D;
+    float top = sk;
+    for (int i = 0; i < NS; ++i) top = max(top, pm[i]);
+    float acc = 0.0f;
+    float lsum = 0.0f;
+    for (int i = 0; i < NS; ++i) {
+        const float w = metal::exp2(pm[i] - top);
+        lsum += pl[i] * w;
+        acc += po[i * D + d] * w;
+    }
+    const T ob = T(acc / (metal::exp2(sk - top) + lsum));
+    if (GATE) {
+        const float g = float(gate[l * gate_strides[1] + (qh * D + d) * gate_strides[2]]);
+        const float e = 1.0f / (1.0f + metal::exp(-metal::abs(g)));
+        out[((size_t)l * HQ + qh) * D + d] = T(float(ob) * (g < 0.0f ? 1.0f - e : e));
+    } else {
+        out[((size_t)qh * L + l) * D + d] = ob;
+    }
+"""
+
 _kernel = None
 _mma_kernel = None
+_combine_kernel = None
 _MMA_THREADS = 128
 _MMA_ROWS = 32
 
@@ -367,28 +403,40 @@ def supports(q, window: int, left_padding, keys: int) -> bool:
     return length > 1 or keys >= MIN_KEYS_ONE_QUERY
 
 
+def supports_fused(q, left_padding, k, v) -> bool:
+    """The fused layer's attention (``fused_decode``): global and sliding layers, any number of keys, batch 1, 1-8
+    queries, a bfloat16 cache; the combine is one kernel there, so the split wins from the shortest caches."""
+    b, _, length, d = q.shape
+    return (left_padding is None and b == 1 and d % 32 == 0 and 1 <= length <= MAX_QUERIES
+            and supports_cache(k, v))
+
+
 def supports_cache(k, v) -> bool:
     """A bfloat16 cache; a head dimension that is not contiguous takes the kernel's scalar loads."""
     return k.dtype == mx.bfloat16 and v.dtype == mx.bfloat16
 
 
-def _chunk(s: int) -> int:
-    """Keys per slice: at least _MIN_CHUNK, at most _MAX_SPLITS slices, a multiple of the key tile."""
-    ch = max(_MIN_CHUNK, math.ceil(s / _MAX_SPLITS))
+def _chunk(s: int, min_chunk: int = _MIN_CHUNK) -> int:
+    """Keys per slice: at least ``min_chunk``, at most _MAX_SPLITS slices, a multiple of the key tile."""
+    ch = max(min_chunk, math.ceil(s / _MAX_SPLITS))
     return (ch + _BK - 1) // _BK * _BK
 
 
-def attention(q, k, v, rel, sink, *, scale: float) -> mx.array:
-    """``banded_sink_attention`` of a global layer: q [1, Hq, L, D], k/v [1, Hkv, S, D] (views of the cache),
-    rel [1, L, Hq, R], sink [1, L, Hq]; returns [1, Hq, L, D] in q's dtype."""
-    global _kernel, _mma_kernel
+def attention(q, k, v, rel, sink, *, scale: float, window: int = 0, gate=None, min_chunk: int = _MIN_CHUNK):
+    """``banded_sink_attention`` for batch 1: q [1, Hq, L, D], k/v [1, Hkv, S, D] (views of the cache),
+    rel [1, L, Hq, R], sink [1, L, Hq]. ``window`` > 0 limits keys to backward distances below it. Returns
+    [1, Hq, L, D] in q's dtype, or with ``gate`` [1, L, Hq * D] the output projection's input."""
+    global _kernel, _mma_kernel, _combine_kernel
     _, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
-    ch = _chunk(s)
-    ns = math.ceil(s / ch)
+    lo = max(0, s - length - window + 1) if window else 0
+    ch = _chunk(s - lo, min_chunk)
+    ns = math.ceil((s - lo) / ch)
     nr = hq // hkv * length
-    inputs = [q, k, v, mx.contiguous(rel), mx.array([s, ch, ns], dtype=mx.int32), mx.array([scale], dtype=mx.float32)]
-    template = [("T", k.dtype), ("D", d), ("HQ", hq), ("HKV", hkv), ("L", length), ("R", rel.shape[-1])]
+    dims = mx.array([s, ch, ns, lo], dtype=mx.int32)
+    inputs = [q, k, v, mx.contiguous(rel), dims, mx.array([scale], dtype=mx.float32)]
+    template = [("T", k.dtype), ("D", d), ("HQ", hq), ("HKV", hkv), ("L", length), ("R", rel.shape[-1]),
+                ("W", window)]
     outputs = {"output_shapes": [(hkv, nr, ns), (hkv, nr, ns), (hkv, nr, ns, d)],
                "output_dtypes": [mx.float32, mx.float32, mx.float32]}
     if length == 1:
@@ -415,10 +463,21 @@ def attention(q, k, v, rel, sink, *, scale: float) -> mx.array:
             inputs=inputs, template=template,
             grid=(ns * _MMA_THREADS, hkv, (nr + _MMA_ROWS - 1) // _MMA_ROWS), threadgroup=(_MMA_THREADS, 1, 1),
             **outputs)
-    # sinks: [1, L, Hq] → rows (hk, g, l) as the kernel orders them; part_m is in the log2 domain
-    sk = sink[0].astype(mx.float32).transpose(1, 0).reshape(hkv, nr) * _LOG2E
-    top = mx.maximum(part_m.max(axis=-1), sk)
-    w = mx.exp((part_m - top[..., None]) * _LN2)
-    total = mx.exp((sk - top) * _LN2) + (part_l * w).sum(axis=-1)
-    out = (part_o * w[..., None]).sum(axis=-2) / total[..., None]
-    return out.reshape(1, hq, length, d).astype(q.dtype)
+    if _combine_kernel is None:
+        _combine_kernel = mx.fast.metal_kernel(
+            name="omlx_0ics_inkling2_split_attn_combine",
+            input_names=["part_m", "part_l", "part_o", "sink", "gate", "dims"],
+            output_names=["out"],
+            source=_COMBINE_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    gated = gate is not None
+    shape = (1, length, hq * d) if gated else (1, hq, length, d)
+    return _combine_kernel(
+        inputs=[part_m, part_l, part_o, sink, gate if gated else sink, dims],
+        template=[("T", q.dtype), ("D", d), ("HQ", hq), ("HKV", hkv), ("L", length), ("GATE", gated)],
+        grid=(hkv * nr * d, 1, 1),
+        threadgroup=(d, 1, 1),
+        output_shapes=[shape],
+        output_dtypes=[q.dtype],
+    )[0]
