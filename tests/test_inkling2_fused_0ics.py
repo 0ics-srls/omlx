@@ -153,7 +153,7 @@ def test_expert_down_projection_matches_gather_qmm(model, tokens):
 
 
 @pytest.mark.parametrize("window,keys", [(WINDOW, 700), (WINDOW, 1087), (WINDOW, 1343), (0, 3000)])
-@pytest.mark.parametrize("length", [1, 5])
+@pytest.mark.parametrize("length", [1, 5, 9, 16])
 def test_split_attention_with_window_and_gate(window, keys, length):
     """The split kernel with a window and the output gate in its combine against the masked path."""
     from omlx.patches.inkling2 import attn_decode, kernels

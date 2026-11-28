@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""0ics: attention of the global layers for decode and speculative verify (1-8 queries), split over the keys.
+"""0ics: attention of the global layers for decode and speculative verify (1-16 queries), split over the keys.
 
 Measured on Inkling 2 Small, M5 Ultra (27/11): generation fell from 57.7 t/s at 30K to 33.8 at 128K with DSpark on.
 A verify of L > 1 queries goes through ``kernels._masked_attention``, which prepends a zero key to the whole cache
@@ -13,7 +13,7 @@ scores, the online softmax runs per row, the sink and the relative bias are appl
 (the sink is a zero-value logit, the bias is added for backward distances below ``R``). A second step combines the
 slices with the sinks.
 
-On with ``OMLX_0ICS_INKLING_ATTN=1``, for the global layers (no window), batch 1, no left padding, 1-8 queries,
+On with ``OMLX_0ICS_INKLING_ATTN=1``, for the global layers (no window), batch 1, no left padding, 1-16 queries,
 a bfloat16 cache. The same switch sends the global layers' prefill chunks to the flash kernel on long caches
 (``FLASH_MIN_KEYS``, see ``kernels._use_flash``).
 """
@@ -25,7 +25,8 @@ import os
 
 import mlx.core as mx
 
-MAX_QUERIES = 8
+# DSpark verifies 9 tokens (anchor + 8 drafts); the fused layer takes up to fused_decode.MAX_TOKENS = 16
+MAX_QUERIES = 16
 MIN_KEYS_ONE_QUERY = 65536
 # global layers' prefill chunks take kernels.flash_banded_attention from this many keys (kernels._use_flash)
 FLASH_MIN_KEYS = 65536
@@ -178,11 +179,14 @@ _SOURCE = """
     }
 """
 
-# The same partials for 2-8 queries on 8x8 simdgroup matrices, as kernels._FLASH_SOURCE computes a prefill block: one
-# threadgroup of 4 simdgroups takes 32 of the 6 L rows of one key/value head and one slice of the keys, in 16-key
-# tiles; the scalar kernel above stays for one query (6 rows would fill a quarter of a 32-row block).
+# The same partials for 2-16 queries on 8x8 simdgroup matrices, as kernels._FLASH_SOURCE computes a prefill block: one
+# threadgroup of NSG simdgroups, 8 rows each, takes all the GQ L rows of one key/value head (up to _MMA_MAX_SG
+# simdgroups) and one slice of the keys, in 16-key tiles, so each slice of the cache is read once for the whole verify.
+# With a fixed 32-row block DSpark's verify of 9 (54 rows on Inkling 2 Small) read the cache twice. The scalar kernel
+# above stays for one query (6 rows would fill a quarter of a 32-row block).
 _MMA_SOURCE = """
-    constexpr int BQ = 32;
+    constexpr int BQ = 8 * NSG;
+    constexpr int THREADS = 32 * NSG;
     constexpr int BKM = 16;
     constexpr int GQ = HQ / HKV;
     constexpr int NR = GQ * L;
@@ -237,7 +241,7 @@ _MMA_SOURCE = """
     for (int k0 = k_lo; k0 < k_hi; k0 += BKM) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (vec_kv) {
-            for (int c = tid; c < BKM * D / 8; c += 128) {
+            for (int c = tid; c < BKM * D / 8; c += THREADS) {
                 const int r = c / (D / 8);
                 const int col = (c % (D / 8)) * 8;
                 const int key = k0 + r;
@@ -257,7 +261,7 @@ _MMA_SOURCE = """
                 }
             }
         } else {
-            for (int c = tid; c < BKM * D; c += 128) {
+            for (int c = tid; c < BKM * D; c += THREADS) {
                 const int r = c / D;
                 const int col = c % D;
                 const int key = k0 + r;
@@ -386,8 +390,13 @@ _COMBINE_SOURCE = """
 _kernel = None
 _mma_kernel = None
 _combine_kernel = None
-_MMA_THREADS = 128
-_MMA_ROWS = 32
+_MMA_MIN_SG = 4
+_MMA_MAX_SG = 16
+
+
+def _mma_simdgroups(rows: int) -> int:
+    """Simdgroups of 8 rows per threadgroup: every row of the head's group, at least 4 for the tile loads."""
+    return min(_MMA_MAX_SG, max(_MMA_MIN_SG, math.ceil(rows / 8)))
 
 
 def enabled() -> bool:
@@ -395,7 +404,7 @@ def enabled() -> bool:
 
 
 def supports(q, window: int, left_padding, keys: int) -> bool:
-    """Global layers, batch 1, 2-8 queries; one query only from ``MIN_KEYS_ONE_QUERY`` keys, below which MLX's
+    """Global layers, batch 1, 2-16 queries; one query only from ``MIN_KEYS_ONE_QUERY`` keys, below which MLX's
     vector SDPA is faster (27/11, M5 Ultra: 0.31 against 0.41 ms at 4K, 1.42 against 1.07 ms at 128K)."""
     b, _, length, d = q.shape
     if window != 0 or left_padding is not None or b != 1 or d % 32 != 0 or not 1 <= length <= MAX_QUERIES:
@@ -404,7 +413,7 @@ def supports(q, window: int, left_padding, keys: int) -> bool:
 
 
 def supports_fused(q, left_padding, k, v) -> bool:
-    """The fused layer's attention (``fused_decode``): global and sliding layers, any number of keys, batch 1, 1-8
+    """The fused layer's attention (``fused_decode``): global and sliding layers, any number of keys, batch 1, 1-16
     queries, a bfloat16 cache; the combine is one kernel there, so the split wins from the shortest caches."""
     b, _, length, d = q.shape
     return (left_padding is None and b == 1 and d % 32 == 0 and 1 <= length <= MAX_QUERIES
@@ -459,9 +468,10 @@ def attention(q, k, v, rel, sink, *, scale: float, window: int = 0, gate=None, m
                 source=_MMA_SOURCE,
                 ensure_row_contiguous=False,
             )
+        nsg = _mma_simdgroups(nr)
         part_m, part_l, part_o = _mma_kernel(
-            inputs=inputs, template=template,
-            grid=(ns * _MMA_THREADS, hkv, (nr + _MMA_ROWS - 1) // _MMA_ROWS), threadgroup=(_MMA_THREADS, 1, 1),
+            inputs=inputs, template=[*template, ("NSG", nsg)],
+            grid=(ns * 32 * nsg, hkv, math.ceil(nr / (8 * nsg))), threadgroup=(32 * nsg, 1, 1),
             **outputs)
     if _combine_kernel is None:
         _combine_kernel = mx.fast.metal_kernel(

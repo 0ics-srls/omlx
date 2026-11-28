@@ -97,7 +97,7 @@ def test_window_cache_switch(env):
 
 
 @pytest.mark.parametrize("keys", [300, 2000, 9000])
-@pytest.mark.parametrize("length", [1, 2, 4, 8])
+@pytest.mark.parametrize("length", [1, 2, 4, 8, 9, 12, 16])
 def test_split_attention_matches_the_stock_path(keys, length):
     """Global layer (no window): the split kernel against _decode_attention (1 query) or _masked_attention, on a
     cache view of a longer buffer as the KVCache gives it."""
@@ -147,7 +147,8 @@ def test_split_attention_dispatch(env):
     q4 = mx.zeros((1, HQ, 4, D), dtype=mx.bfloat16)
     assert attn_decode.supports(q4, 0, None, 100)
     assert not attn_decode.supports(q4, WINDOW, None, 100)  # sliding layers keep their path
-    assert not attn_decode.supports(mx.zeros((1, HQ, 9, D), dtype=mx.bfloat16), 0, None, 100)
+    assert attn_decode.supports(mx.zeros((1, HQ, 9, D), dtype=mx.bfloat16), 0, None, 100)  # DSpark's verify
+    assert not attn_decode.supports(mx.zeros((1, HQ, attn_decode.MAX_QUERIES + 1, D), dtype=mx.bfloat16), 0, None, 100)
     assert not attn_decode.supports(q1, 0, None, attn_decode.MIN_KEYS_ONE_QUERY - 1)
     assert attn_decode.supports(q1, 0, None, attn_decode.MIN_KEYS_ONE_QUERY)
     env.delenv("OMLX_0ICS_INKLING_ATTN", raising=False)
