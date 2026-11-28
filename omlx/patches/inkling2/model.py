@@ -23,7 +23,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
-from . import fused_decode, kernels, window_cache
+from . import attn_sparse, fused_decode, kernels, window_cache
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -464,7 +464,11 @@ class Inkling2Attention(nn.Module):
 
     def attend(self, q, k, v, rel, sink, kv):
         if kv is not None:
+            start = kv.offset
             k, v = kv.update_and_fetch(k, v)
+            if self.window == 0 and attn_sparse.enabled():
+                # the bounds of overwritten blocks (attn_sparse.py) go stale
+                attn_sparse.note_append(kv, start)
         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
         return kernels.banded_sink_attention(
             q,

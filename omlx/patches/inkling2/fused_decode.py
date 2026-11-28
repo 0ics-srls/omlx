@@ -668,7 +668,7 @@ def _gather(proj, x, lhs, rhs):
 
 def layer_forward(layer, h, blocks, kv, states):
     """``Inkling2Layer.__call__`` for a short input (``supports``); returns (h, the four conv windows)."""
-    from . import attn_decode, kernels
+    from . import attn_decode, attn_sparse, kernels
     from .model import _softcapped_swiglu
 
     hidden = h.shape[-1]
@@ -676,9 +676,19 @@ def layer_forward(layer, h, blocks, kv, states):
     h_n, xs = pre(layer, h, blocks)
     q, k, v, rel, gate, sink, ks, vs = project(attn, xs, states[0], states[1], kv.offset if kv is not None else 0)
     left_padding = getattr(kv, "left_padding", None) if kv is not None else None
+    sparse = kv is not None and attn.window == 0 and attn_sparse.enabled()
     if kv is not None:
+        start = kv.offset
         k, v = kv.update_and_fetch(k, v)
-    if attn_decode.supports_fused(q, left_padding, k, v):
+        if sparse:
+            attn_sparse.note_append(kv, start)
+    o_in = None
+    if sparse and attn_decode.supports_fused(q, left_padding, k, v):
+        # 0ics OMLX_0ICS_INKLING_SPARSE: the selected blocks and the tail of the cache only (attn_sparse.py)
+        o_in = attn_sparse.attention(kv, q, k, v, rel, sink, scale=attn.scale, gate=gate, min_chunk=MIN_CHUNK)
+    if o_in is not None:
+        a = attn.o_proj(o_in)
+    elif attn_decode.supports_fused(q, left_padding, k, v):
         # the split attention, with the sink and the output gate in its combine: o_proj's input
         o_in = attn_decode.attention(q, k, v, rel, sink, scale=attn.scale, window=attn.window, gate=gate,
                                      min_chunk=MIN_CHUNK)

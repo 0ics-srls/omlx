@@ -35,7 +35,15 @@ _THREADS = 256
 _MAX_SPLITS = 128
 _MIN_CHUNK = 256
 
-_SOURCE = """
+# The slices run over positions of a key list: with SEL, the first dims[4] are the dims[6] blocks of BLK keys of
+# ``sel`` (one row per key/value head, see attn_sparse.py), the rest the keys from dims[5] to the end of the cache;
+# without SEL, the keys from dims[3]. Loads and backward distances take the key's index in the cache, so the
+# relative bias and the causal mask are the full attention's on the keys read.
+_PHYS = """
+#define PHYS(x) (SEL ? ((x) < dims[4] ? sel[hk * dims[6] + (x) / BLK] * BLK + (x) % BLK : dims[5] + (x) - dims[4]) : (x))
+"""
+
+_SOURCE = _PHYS + """
     constexpr int GQ = HQ / HKV;
     constexpr int NR = GQ * L;
     constexpr int PER_SG = (NR + 7) / 8;
@@ -50,7 +58,7 @@ _SOURCE = """
     const int CH = dims[1];
     const int NS = dims[2];
     const int k_lo = dims[3] + split * CH;
-    const int k_hi = min(S, k_lo + CH);
+    const int k_hi = min(dims[7], k_lo + CH);
     const float qscale = scale[0] * LOG2E;
 
     threadgroup half Qs[NR * D];
@@ -90,8 +98,9 @@ _SOURCE = """
                 float kv = 0.0f;
                 float vv = 0.0f;
                 if (key < k_hi) {
-                    kv = float(kb[key * k_strides[2] + c * k_strides[3]]);
-                    vv = float(vb[key * v_strides[2] + c * v_strides[3]]);
+                    const int pk = PHYS(key);
+                    kv = float(kb[pk * k_strides[2] + c * k_strides[3]]);
+                    vv = float(vb[pk * v_strides[2] + c * v_strides[3]]);
                 }
                 Ks[kk * LDK + c] = half(kv);
                 Vs[kk * D + c] = half(vv);
@@ -105,8 +114,9 @@ _SOURCE = """
             uint4 kw = uint4(0);
             uint4 vw = uint4(0);
             if (key < k_hi) {
-                kw = *(const device uint4*)(kb + key * k_strides[2] + c);
-                vw = *(const device uint4*)(vb + key * v_strides[2] + c);
+                const int pk = PHYS(key);
+                kw = *(const device uint4*)(kb + pk * k_strides[2] + c);
+                vw = *(const device uint4*)(vb + pk * v_strides[2] + c);
             }
             threadgroup half* kd = Ks + kk * LDK + c;
             threadgroup half* vd = Vs + kk * D + c;
@@ -126,7 +136,7 @@ _SOURCE = """
             }
             const int qh = hk * GQ + r / L;
             const int l = r % L;
-            const int d = (S - L + l) - key;
+            const int d = (S - L + l) - (key < k_hi ? PHYS(key) : key);
             const bool vis = key < k_hi && d >= 0 && (W == 0 || d < W);
             float s = 0.0f;
             const threadgroup half* qr = Qs + r * D;
@@ -184,7 +194,7 @@ _SOURCE = """
 # simdgroups) and one slice of the keys, in 16-key tiles, so each slice of the cache is read once for the whole verify.
 # With a fixed 32-row block DSpark's verify of 9 (54 rows on Inkling 2 Small) read the cache twice. The scalar kernel
 # above stays for one query (6 rows would fill a quarter of a 32-row block).
-_MMA_SOURCE = """
+_MMA_SOURCE = _PHYS + """
     constexpr int BQ = 8 * NSG;
     constexpr int THREADS = 32 * NSG;
     constexpr int BKM = 16;
@@ -203,7 +213,7 @@ _MMA_SOURCE = """
     const int CH = dims[1];
     const int NS = dims[2];
     const int k_lo = dims[3] + split * CH;
-    const int k_hi = min(S, k_lo + CH);
+    const int k_hi = min(dims[7], k_lo + CH);
     const short qid = lane / 4;
     const short fm = (qid & 4) + ((lane / 2) % 4);
     const short fn = (qid & 2) * 2 + (lane % 2) * 2;
@@ -248,8 +258,9 @@ _MMA_SOURCE = """
                 uint4 kw = uint4(0);
                 uint4 vw = uint4(0);
                 if (key < k_hi) {
-                    kw = *(const device uint4*)(kb_ptr + key * k_strides[2] + col);
-                    vw = *(const device uint4*)(vb_ptr + key * v_strides[2] + col);
+                    const int pk = PHYS(key);
+                    kw = *(const device uint4*)(kb_ptr + pk * k_strides[2] + col);
+                    vw = *(const device uint4*)(vb_ptr + pk * v_strides[2] + col);
                 }
                 threadgroup half* kd = Ks + col * LDK + r;
                 threadgroup half* vd = Vs + r * LDV + col;
@@ -268,8 +279,9 @@ _MMA_SOURCE = """
                 float kv = 0.0f;
                 float vv = 0.0f;
                 if (key < k_hi) {
-                    kv = float(kb_ptr[key * k_strides[2] + col * k_strides[3]]);
-                    vv = float(vb_ptr[key * v_strides[2] + col * v_strides[3]]);
+                    const int pk = PHYS(key);
+                    kv = float(kb_ptr[pk * k_strides[2] + col * k_strides[3]]);
+                    vv = float(vb_ptr[pk * v_strides[2] + col * v_strides[3]]);
                 }
                 Ks[col * LDK + r] = half(kv);
                 Vs[r * LDV + col] = half(vv);
@@ -293,7 +305,7 @@ _MMA_SOURCE = """
         for (int kb = 0; kb < BKM / 8; ++kb) {
             for (int e = 0; e < 2; ++e) {
                 const int key = k0 + kb * 8 + fn + e;
-                const int d = a_row - key;
+                const int d = a_row - (key < k_hi ? PHYS(key) : key);
                 const bool vis = row_ok && key < k_hi && d >= 0 && (W == 0 || d < W);
                 float sc = Sf[kb].thread_elements()[e] * qscale;
                 if (vis) {
@@ -431,28 +443,35 @@ def _chunk(s: int, min_chunk: int = _MIN_CHUNK) -> int:
     return (ch + _BK - 1) // _BK * _BK
 
 
-def attention(q, k, v, rel, sink, *, scale: float, window: int = 0, gate=None, min_chunk: int = _MIN_CHUNK):
+def attention(q, k, v, rel, sink, *, scale: float, window: int = 0, gate=None, min_chunk: int = _MIN_CHUNK,
+              sel=None, block: int = 0, far: int = 0):
     """``banded_sink_attention`` for batch 1: q [1, Hq, L, D], k/v [1, Hkv, S, D] (views of the cache),
     rel [1, L, Hq, R], sink [1, L, Hq]. ``window`` > 0 limits keys to backward distances below it. Returns
-    [1, Hq, L, D] in q's dtype, or with ``gate`` [1, L, Hq * D] the output projection's input."""
+    [1, Hq, L, D] in q's dtype, or with ``gate`` [1, L, Hq * D] the output projection's input.
+
+    With ``sel`` (int32 [Hkv, n], ascending block indices, global layers only) each key/value head reads its n blocks
+    of ``block`` keys and the keys from ``far`` to the end, nothing else (attn_sparse.py)."""
     global _kernel, _mma_kernel, _combine_kernel
     _, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
     lo = max(0, s - length - window + 1) if window else 0
-    ch = _chunk(s - lo, min_chunk)
-    ns = math.ceil((s - lo) / ch)
+    picked = 0 if sel is None else sel.shape[1] * block
+    keys = picked + s - far if sel is not None else s
+    ch = _chunk(keys - lo, min_chunk)
+    ns = math.ceil((keys - lo) / ch)
     nr = hq // hkv * length
-    dims = mx.array([s, ch, ns, lo], dtype=mx.int32)
-    inputs = [q, k, v, mx.contiguous(rel), dims, mx.array([scale], dtype=mx.float32)]
+    dims = mx.array([s, ch, ns, lo, picked, far, 0 if sel is None else sel.shape[1], keys], dtype=mx.int32)
+    inputs = [q, k, v, mx.contiguous(rel), dims, mx.array([scale], dtype=mx.float32),
+              dims if sel is None else sel]
     template = [("T", k.dtype), ("D", d), ("HQ", hq), ("HKV", hkv), ("L", length), ("R", rel.shape[-1]),
-                ("W", window)]
+                ("W", window), ("SEL", sel is not None), ("BLK", block if sel is not None else 1)]
     outputs = {"output_shapes": [(hkv, nr, ns), (hkv, nr, ns), (hkv, nr, ns, d)],
                "output_dtypes": [mx.float32, mx.float32, mx.float32]}
     if length == 1:
         if _kernel is None:
             _kernel = mx.fast.metal_kernel(
                 name="omlx_0ics_inkling2_split_attn",
-                input_names=["q", "k", "v", "rel", "dims", "scale"],
+                input_names=["q", "k", "v", "rel", "dims", "scale", "sel"],
                 output_names=["part_m", "part_l", "part_o"],
                 source=_SOURCE,
                 ensure_row_contiguous=False,
@@ -463,7 +482,7 @@ def attention(q, k, v, rel, sink, *, scale: float, window: int = 0, gate=None, m
         if _mma_kernel is None:
             _mma_kernel = mx.fast.metal_kernel(
                 name="omlx_0ics_inkling2_split_attn_mma",
-                input_names=["q", "k", "v", "rel", "dims", "scale"],
+                input_names=["q", "k", "v", "rel", "dims", "scale", "sel"],
                 output_names=["part_m", "part_l", "part_o"],
                 source=_MMA_SOURCE,
                 ensure_row_contiguous=False,
